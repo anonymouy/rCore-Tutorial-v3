@@ -38,7 +38,7 @@ __alltraps:
     call trap_handler
 
 __restore:
-    # now sp->kernel stack(after allocated), sscratch->user stack
+    # now sp->kernel stack(after allocated), sscratch->user stack(not for the first time)
     # restore sstatus/sepc
     ld t0, 32*8(sp)
     ld t1, 33*8(sp)
