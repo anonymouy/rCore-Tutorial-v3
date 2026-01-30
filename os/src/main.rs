@@ -53,6 +53,40 @@ fn clear_bss() {
 #[unsafe(no_mangle)]
 pub fn rust_main() -> ! {
     clear_bss();
+
+    // unsafe extern "C" {
+    //     safe fn sdata();
+    //     safe fn edata();
+    //     safe fn srodata();
+    //     safe fn erodata();
+    //     safe fn sbss();
+    //     safe fn ebss();
+    // }
+
+    // let tm: &task::TaskManager = &*task::TASK_MANAGER; // 初始化并得到引用
+    // let byte_ptr = tm as *const task::TaskManager as *const u8;
+    // let size = size_of::<task::TaskManager>();
+    // println!("ptr 0x{:x}", byte_ptr as usize);
+    // // Safety:
+    // // - tm is a valid reference, so the memory [byte_ptr, byte_ptr+size) is valid to read.
+    // // - we only read as bytes, which does not violate aliasing rules.
+    // //第一种方法
+    // for i in 0..size/8 {
+    //     println!("usize {:016x}", unsafe {(byte_ptr as *const usize).add(i).read_volatile()});
+    // }
+    // //第二种方法
+    // let bytes: &[u8] = unsafe { core::slice::from_raw_parts(byte_ptr, size) };
+    // for (i, b) in bytes.iter().enumerate() {
+    //     if i % core::mem::size_of::<usize>() == 0 {
+    //         print!("\n{:04x}: ", i);
+    //     }
+    //     print!("{:02x} ", b);
+    // }
+    // println!("task manager address 0x{:x}", &task::TASK_MANAGER as *const _ as usize);
+    // println!("sdata 0x{:x}  edata 0x{:x}", sdata as usize, edata as usize);
+    // println!("srodata 0x{:x}  erodata 0x{:x}", srodata as usize, erodata as usize);
+    // println!("sbss 0x{:x}  ebss 0x{:x}", sbss as usize, ebss as usize);
+
     logging::init();
     info!("[kernel] Hello, world!");
     trap::init();

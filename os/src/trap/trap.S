@@ -45,6 +45,7 @@ __restore:
     ld t2, 2*8(sp)
     csrw sstatus, t0
     csrw sepc, t1
+    # user stack pointer loaded in sscratch in below asm code
     csrw sscratch, t2
     # restore general-purpuse registers except sp/tp
     ld x1, 1*8(sp)
