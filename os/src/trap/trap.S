@@ -1,3 +1,4 @@
+.attribute arch, "rv64gc"
 .altmacro
 .macro SAVE_GP n
     sd x\n, \n*8(sp)
@@ -5,15 +6,22 @@
 .macro LOAD_GP n
     ld x\n, \n*8(sp)
 .endm
+.macro SAVE_FR n
+    fsd f\n, (\n+34)*8(sp)
+.endm
+.macro LOAD_FR n
+    fld f\n, (\n+34)*8(sp)
+.endm
     .section .text
     .globl __alltraps
     .globl __restore
+    .globl __restore_switch
     .align 2
 __alltraps:
     csrrw sp, sscratch, sp
     # now sp->kernel stack, sscratch->user stack
     # allocate a TrapContext on kernel stack
-    addi sp, sp, -34*8
+    addi sp, sp, -68*8
     # save general-purpose registers
     sd x1, 1*8(sp)
     # skip sp(x2), we will save it later
@@ -33,6 +41,15 @@ __alltraps:
     # read user stack from sscratch and save it on the kernel stack
     csrr t2, sscratch
     sd t2, 2*8(sp)
+    # save float registers
+    .set n, 0
+    .rept 32
+        SAVE_FR %n
+        .set n, n+1
+    .endr
+    # save fcsr
+    csrr t3, fcsr
+    sd t3, 66*8(sp)
     # set input argument of trap_handler(cx: &mut TrapContext)
     mv a0, sp
     call trap_handler
@@ -54,8 +71,22 @@ __restore:
         LOAD_GP %n
         .set n, n+1
     .endr
+    # load float registers
+    .set n, 0
+    .rept 32
+        LOAD_FR %n
+        .set n, n+1
+    .endr
+    # load fcsr
+    ld t3, 66*8(sp)
+    csrw fcsr, t3
     # release TrapContext on kernel stack
-    addi sp, sp, 34*8
+    addi sp, sp, 68*8
     # now sp->kernel stack, sscratch->user stack
     csrrw sp, sscratch, sp
     sret
+
+__restore_switch:
+    call switch_refresh_and_return
+    call add_switch_time
+    j __restore

@@ -45,6 +45,7 @@ kernel:
 
 clean:
 	@cargo clean
+	@cd ../user && make clean
 
 disasm: kernel
 	@$(OBJDUMP) $(DISASM) $(KERNEL_ELF) | less

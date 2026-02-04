@@ -25,10 +25,10 @@ impl TaskContext {
     /// set task context {__restore ASM funciton, kernel stack, s_0..12 }
     pub fn goto_restore(kstack_ptr: usize) -> Self {
         unsafe extern "C" {
-            unsafe fn __restore();
+            unsafe fn __restore_switch();
         }
         Self {
-            ra: __restore as usize,
+            ra: __restore_switch as usize,
             sp: kstack_ptr,
             s: [0; 12],
         }

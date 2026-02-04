@@ -15,7 +15,7 @@
 mod context;
 
 use crate::syscall::syscall;
-use crate::task::{exit_current_and_run_next, suspend_current_and_run_next};
+use crate::task::{add_current_kernel_time, add_current_user_time, exit_current_and_run_next, suspend_current_and_run_next};
 use crate::timer::set_next_trigger;
 use core::arch::global_asm;
 use riscv::register::{
@@ -25,7 +25,6 @@ use riscv::register::{
 };
 
 global_asm!(include_str!("trap.S"));
-
 /// initialize CSR `stvec` as the entry of `__alltraps`
 pub fn init() {
     unsafe extern "C" {
@@ -46,6 +45,7 @@ pub fn enable_timer_interrupt() {
 #[unsafe(no_mangle)]
 /// handle an interrupt, exception, or system call from user space
 pub fn trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
+    add_current_user_time();
     let scause = scause::read(); // get trap cause
     let stval = stval::read(); // get extra value
     match scause.cause() {
@@ -76,6 +76,7 @@ pub fn trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
             );
         }
     }
+    add_current_kernel_time();
     cx
 }
 

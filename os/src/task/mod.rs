@@ -19,11 +19,15 @@ use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sbi::shutdown;
 use crate::sync::UPSafeCell;
+use crate::timer::{get_time_ms};
 use lazy_static::*;
-use switch::__switch;
+use switch::{__switch, add_switch_time, get_switch_time, switch_refresh_and_return};
 use task::{TaskControlBlock, TaskStatus};
+use log::*;
 
 pub use context::TaskContext;
+
+static mut TMP_TIME: usize = 0;
 
 /// The task manager, where all the tasks are managed.
 ///
@@ -56,6 +60,8 @@ lazy_static! {
         let mut tasks = [TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
+            user_time: 0,
+            kernel_time: 0
         }; MAX_APP_NUM];
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
@@ -86,6 +92,9 @@ impl TaskManager {
         drop(inner);
         let mut _unused = TaskContext::zero_init();
         // before this, we should drop local variables that must be dropped manually
+        // timing starts
+        refresh_and_return();
+        switch_refresh_and_return();
         unsafe {
             __switch(&mut _unused as *mut TaskContext, next_task_cx_ptr);
         }
@@ -97,6 +106,8 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let current = inner.current_task;
         inner.tasks[current].task_status = TaskStatus::Ready;
+        // add kernel time to current app
+        inner.tasks[current].kernel_time += refresh_and_return();
     }
 
     /// Change the status of current `Running` task into `Exited`.
@@ -104,6 +115,9 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let current = inner.current_task;
         inner.tasks[current].task_status = TaskStatus::Exited;
+        // add kernel time to current app
+        inner.tasks[current].kernel_time += refresh_and_return();
+        println!("user time {}ms, kernel time {}ms", inner.tasks[current].user_time, inner.tasks[current].kernel_time);
     }
 
     /// Find next task to run and return task id.
@@ -129,14 +143,32 @@ impl TaskManager {
             let next_task_cx_ptr = &inner.tasks[next].task_cx as *const TaskContext;
             drop(inner);
             // before this, we should drop local variables that must be dropped manually
+            if current != 3 || next != 3 {trace!("{} is previous task, {} is going to be excuted", current, next);}
+            switch_refresh_and_return();
             unsafe {
                 __switch(current_task_cx_ptr, next_task_cx_ptr);
             }
+            add_switch_time(switch_refresh_and_return());
             // go back to user mode
         } else {
             println!("All applications completed!");
+            println!("Switch time {}us in total", get_switch_time());
             shutdown(false);
         }
+    }
+
+    /// add current user time
+    pub fn add_current_user_time(&self, time: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].user_time += time;
+    } 
+
+    /// add current kernel time
+    pub fn add_current_kernel_time(&self, time: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].kernel_time += time;
     }
 }
 
@@ -170,4 +202,27 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+
+/// refresh time and return gap time
+pub fn refresh_and_return() -> usize {
+    // let present_time = get_time_ms();
+    // let gap = present_time - unsafe { TMP_TIME };
+    // unsafe { TMP_TIME = present_time };
+    // gap
+    let time_before = unsafe { TMP_TIME };
+    unsafe { TMP_TIME = get_time_ms(); 
+    TMP_TIME - time_before
+    }
+}
+
+/// pub fn add current user time
+pub fn add_current_user_time() {
+    TASK_MANAGER.add_current_user_time(refresh_and_return());
+}
+
+/// pub fn add current kernel time
+pub fn add_current_kernel_time() {
+    TASK_MANAGER.add_current_kernel_time(refresh_and_return());
 }
