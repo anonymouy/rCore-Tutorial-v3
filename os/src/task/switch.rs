@@ -61,12 +61,12 @@ lazy_static! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn add_switch_time(time: usize) {
+pub fn add_switch_time(time: usize) {
     SWITCH_TIME.add(time);
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn switch_refresh_and_return() -> usize {
+pub fn switch_refresh_and_return() -> usize {
     SWITCH_TIME.switch_refresh_and_return()
 }
 

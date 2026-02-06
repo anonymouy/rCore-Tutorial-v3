@@ -18,6 +18,7 @@ use crate::syscall::syscall;
 use crate::task::{add_current_kernel_time, add_current_user_time, exit_current_and_run_next, suspend_current_and_run_next};
 use crate::timer::set_next_trigger;
 use core::arch::global_asm;
+use riscv::register::sstatus;
 use riscv::register::{
     mtvec::TrapMode,
     scause::{self, Exception, Interrupt, Trap},
@@ -42,9 +43,44 @@ pub fn enable_timer_interrupt() {
     }
 }
 
+/// distribute trap
 #[unsafe(no_mangle)]
-/// handle an interrupt, exception, or system call from user space
 pub fn trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
+    // no float in kernel mode
+    unsafe {sstatus::set_fs(sstatus::FS::Off);}
+    match sstatus::read().spp() {
+        sstatus::SPP::Supervisor => kernel_trap_handler(cx),
+        sstatus::SPP::User => user_trap_handler(cx),
+    }
+    // 没有必要在这里放一个，因为内核态在被call，返回后将数据加载到寄存器上时先加载之前的sstatus
+    // unsafe {sstatus::set_fs(sstatus::FS::Dirty);}
+}
+
+/// kernel trap handle
+pub fn kernel_trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
+    let scause = scause::read();
+    let stval = stval::read();
+    match scause.cause() {
+        Trap::Interrupt(Interrupt::SupervisorTimer) => {
+            // 内核中断来自一个时钟中断
+            println!("kernel interrupt: from timer");
+            // 标记一下触发了中断
+            trigger_kernel_interrupt();
+            set_next_trigger();
+        }
+        Trap::Exception(Exception::StoreFault) | Trap::Exception(Exception::StorePageFault) => {
+            panic!("[kernel] PageFault in kernel, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.", stval, cx.sepc);
+        }
+        _ => {
+            // 其他的内核异常/中断
+            panic!("unknown kernel exception or interrupt");
+        }
+    }
+    cx
+}
+
+/// handle an interrupt, exception, or system call from user space
+pub fn user_trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
     add_current_user_time();
     let scause = scause::read(); // get trap cause
     let stval = stval::read(); // get extra value
@@ -81,3 +117,17 @@ pub fn trap_handler(cx: &mut TrapContext) -> &mut TrapContext {
 }
 
 pub use context::TrapContext;
+
+static mut KERNEL_INTERRUPT_TRIGGERED: bool = false;
+
+/// 检查内核中断是否触发
+pub fn check_kernel_interrupt() -> bool {
+    unsafe { (&raw mut KERNEL_INTERRUPT_TRIGGERED).read_volatile() }
+}
+
+/// 标记内核中断已触发
+pub fn trigger_kernel_interrupt() {
+    unsafe {
+        (&raw mut KERNEL_INTERRUPT_TRIGGERED).write_volatile(true);
+    }
+}

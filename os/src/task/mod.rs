@@ -211,9 +211,9 @@ pub fn refresh_and_return() -> usize {
     // let gap = present_time - unsafe { TMP_TIME };
     // unsafe { TMP_TIME = present_time };
     // gap
-    let time_before = unsafe { TMP_TIME };
-    unsafe { TMP_TIME = get_time_ms(); 
-    TMP_TIME - time_before
+    let time_before = unsafe { (&raw mut TMP_TIME).read_volatile() };
+    unsafe { (&raw mut TMP_TIME).write_volatile(get_time_ms()); 
+    (&raw mut TMP_TIME).read_volatile() - time_before
     }
 }
 
