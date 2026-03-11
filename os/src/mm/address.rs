@@ -26,7 +26,7 @@ pub struct PhysPageNum(pub usize);
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub struct VirtPageNum(pub usize);
 
-/// Debugging
+// Debugging
 
 impl Debug for VirtAddr {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -49,9 +49,9 @@ impl Debug for PhysPageNum {
     }
 }
 
-/// T: {PhysAddr, VirtAddr, PhysPageNum, VirtPageNum}
-/// T -> usize: T.0
-/// usize -> T: usize.into()
+// T: {PhysAddr, VirtAddr, PhysPageNum, VirtPageNum}
+// T -> usize: T.0
+// usize -> T: usize.into()
 
 impl From<usize> for PhysAddr {
     fn from(v: usize) -> Self {

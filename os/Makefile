@@ -59,7 +59,9 @@ run: run-inner
 QEMU_ARGS := -machine virt \
 			 -nographic \
 			 -bios $(BOOTLOADER) \
-			 -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA)
+			 -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
+             -netdev user,id=net0,hostfwd=tcp::5555-:5555 \
+             -device virtio-net-device,netdev=net0
 
 QEMU_NAME := qemu-system-riscv64
 qemu-version-check:

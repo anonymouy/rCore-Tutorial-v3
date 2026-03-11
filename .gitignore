@@ -16,6 +16,7 @@ user/build
 user/target/*
 user/.idea/*
 user/Cargo.lock
+user/src/*
 easy-fs/Cargo.lock
 easy-fs/target/*
 easy-fs-fuse/Cargo.lock
@@ -23,3 +24,4 @@ easy-fs-fuse/target/*
 tools/
 pushall.sh
 *.bak
+*.patch

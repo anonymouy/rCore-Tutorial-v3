@@ -44,6 +44,7 @@ pub mod syscall;
 pub mod task;
 mod timer;
 pub mod trap;
+mod network;
 
 core::arch::global_asm!(include_str!("entry.asm"));
 core::arch::global_asm!(include_str!("link_app.S"));
@@ -62,7 +63,7 @@ fn clear_bss() {
 
 /// the rust entry-point of os
 #[unsafe(no_mangle)]
-pub fn rust_main() -> ! {
+pub fn rust_main(_hartid: usize, dtb_paddr: usize) -> ! {
     clear_bss();
     logging::init();
     info!("[kernel] Hello, world!");
@@ -71,6 +72,7 @@ pub fn rust_main() -> ! {
     mm::remap_test();
     trap::init();
     //trap::enable_interrupt();
+    network::init(dtb_paddr);
     trap::enable_timer_interrupt();
     timer::set_next_trigger();
     task::run_first_task();
