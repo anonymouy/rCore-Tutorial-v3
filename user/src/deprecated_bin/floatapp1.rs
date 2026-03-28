@@ -1,0 +1,27 @@
+#![no_std]
+#![no_main]
+
+#[macro_use]
+extern crate user_lib;
+const LEN: usize = 100;
+#[unsafe(no_mangle)]
+fn main() -> i32 {
+    println!("float1 app begins");
+    println!("{:.2} is float number", 2.0 * 3.0);
+    let p = 7u64;
+    let m = 998244353u64;
+    let iter: usize = 300000;
+    let mut s = [0u64; LEN];
+    let mut cur = 0usize;
+    s[cur] = 1;
+    for i in 1..=iter {
+        let next = if cur + 1 == LEN { 0 } else { cur + 1 };
+        s[next] = s[cur] * p % m;
+        cur = next;
+        if i % 10000 == 0 {
+            println!("power_9 [{}/{}]", i, iter);
+        }
+    }
+    println!("{}^{} = {}(MOD {})", p, iter, s[cur], m);
+    0
+}
