@@ -1,15 +1,15 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use lazy_static::lazy_static;
-use lose_net_stack::IPv4;
 
+use super::IPv4;
 use crate::sync::UPIntrFreeCell;
 
 // TODO: specify the protocol, TCP or UDP
 pub struct Socket {
     pub raddr: IPv4,                // remote address
     pub lport: u16,                 // local port
-    pub rport: u16,                 // rempote port
+    pub rport: u16,                 // remote port
     pub buffers: VecDeque<Vec<u8>>, // datas
     pub seq: u32,
     pub ack: u32,

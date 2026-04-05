@@ -1,12 +1,10 @@
-use super::LOSE_NET_STACK;
-use super::NET_DEVICE;
-use super::net_interrupt_handler;
-use super::socket::{add_socket, pop_data, remove_socket};
+use crate::drivers::NET_DEVICE;
 use crate::fs::File;
 use alloc::vec;
-use lose_net_stack::IPv4;
-use lose_net_stack::MacAddress;
-use lose_net_stack::packets::udp::UDPPacket;
+
+use super::net_interrupt_handler;
+use super::socket::{add_socket, pop_data, remove_socket};
+use super::{build_udp_packet, IPv4, MacAddress, NET_CONFIG};
 
 pub struct UDP {
     pub target: IPv4,
@@ -61,10 +59,9 @@ impl File for UDP {
     }
 
     fn write(&self, buf: crate::mm::UserBuffer) -> usize {
-        let lose_net_stack = LOSE_NET_STACK.0.exclusive_access();
+        let cfg = NET_CONFIG.exclusive_access();
 
         let mut data = vec![0u8; buf.len()];
-
         let mut left = 0;
         for i in 0..buf.buffers.len() {
             data[left..(left + buf.buffers[i].len())].copy_from_slice(buf.buffers[i]);
@@ -73,17 +70,16 @@ impl File for UDP {
 
         let len = data.len();
 
-        let udp_packet = UDPPacket::new(
-            lose_net_stack.ip,
-            lose_net_stack.mac,
+        let frame = build_udp_packet(
+            &cfg.mac,
+            &MacAddress::BROADCAST,
+            &cfg.ip,
+            &self.target,
             self.sport,
-            self.target,
-            MacAddress::new([0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
             self.dport,
-            len,
-            data.as_ref(),
+            &data,
         );
-        NET_DEVICE.transmit(&udp_packet.build_data());
+        NET_DEVICE.transmit(&frame);
         len
     }
 }

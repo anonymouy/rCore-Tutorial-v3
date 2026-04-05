@@ -1,12 +1,12 @@
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::lazy_static;
-use lose_net_stack::packets::tcp::TCPPacket;
 
 use crate::fs::File;
 use crate::sync::UPIntrFreeCell;
 use crate::task::TaskControlBlock;
 
 use super::tcp::TCP;
+use super::ParsedTcp;
 
 pub struct Port {
     pub port: u16,
@@ -64,7 +64,7 @@ pub fn port_acceptable(listen_index: usize) -> bool {
 }
 
 // check whether it can accept request
-pub fn check_accept(port: u16, tcp_packet: &TCPPacket) -> Option<()> {
+pub fn check_accept(port: u16, tcp_packet: &ParsedTcp) -> Option<()> {
     LISTEN_TABLE.exclusive_session(|listen_table| {
         let mut listen_ports: Vec<&mut Option<Port>> = listen_table
             .iter_mut()
@@ -78,7 +78,6 @@ pub fn check_accept(port: u16, tcp_packet: &TCPPacket) -> Option<()> {
         } else {
             let listen_port = listen_ports[0].as_mut().unwrap();
             let task = listen_port.schedule.clone().unwrap();
-            // wakeup_task(Arc::clone(&listen_port.schedule.clone().unwrap()));
             listen_port.schedule = None;
             listen_port.receivable = false;
 
@@ -88,7 +87,7 @@ pub fn check_accept(port: u16, tcp_packet: &TCPPacket) -> Option<()> {
     })
 }
 
-pub fn accept_connection(_port: u16, tcp_packet: &TCPPacket, task: Arc<TaskControlBlock>) {
+pub fn accept_connection(_port: u16, tcp_packet: &ParsedTcp, task: Arc<TaskControlBlock>) {
     let process = task.process.upgrade().unwrap();
     let mut inner = process.inner_exclusive_access();
     let fd = inner.alloc_fd();
