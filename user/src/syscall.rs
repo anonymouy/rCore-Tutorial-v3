@@ -193,3 +193,19 @@ pub fn sys_event_get() -> isize {
 pub fn sys_key_pressed() -> isize {
     syscall(SYSCALL_KEY_PRESSED, [0, 0, 0])
 }
+
+const SYSCALL_NET_BYPASS_SETUP: usize = 4000;
+const SYSCALL_NET_BYPASS_TX: usize = 4001;
+const SYSCALL_NET_BYPASS_RX: usize = 4002;
+
+pub fn sys_net_bypass_setup() -> isize {
+    syscall(SYSCALL_NET_BYPASS_SETUP, [0, 0, 0])
+}
+
+pub fn sys_net_bypass_tx() -> isize {
+    syscall(SYSCALL_NET_BYPASS_TX, [0, 0, 0])
+}
+
+pub fn sys_net_bypass_rx() -> isize {
+    syscall(SYSCALL_NET_BYPASS_RX, [0, 0, 0])
+}

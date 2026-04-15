@@ -4,7 +4,7 @@ use crate::{drivers::NET_DEVICE, fs::File};
 
 use super::socket::get_s_a_by_index;
 use super::{
-    net_interrupt_handler,
+    net_poll_handler,
     socket::{add_socket, pop_data, remove_socket},
     IPv4, MacAddress, TcpFlags, NET_CONFIG,
     internet_checksum,
@@ -64,7 +64,7 @@ impl File for TCP {
                 }
                 return left;
             } else {
-                net_interrupt_handler();
+                net_poll_handler();
             }
         }
     }

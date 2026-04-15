@@ -32,6 +32,9 @@ const SYSCALL_FRAMEBUFFER: usize = 2000;
 const SYSCALL_FRAMEBUFFER_FLUSH: usize = 2001;
 const SYSCALL_EVENT_GET: usize = 3000;
 const SYSCALL_KEY_PRESSED: usize = 3001;
+const SYSCALL_NET_BYPASS_SETUP: usize = 4000;
+const SYSCALL_NET_BYPASS_TX: usize = 4001;
+const SYSCALL_NET_BYPASS_RX: usize = 4002;
 
 mod fs;
 mod gui;
@@ -85,6 +88,9 @@ pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
         SYSCALL_FRAMEBUFFER_FLUSH => sys_framebuffer_flush(),
         SYSCALL_EVENT_GET => sys_event_get(),
         SYSCALL_KEY_PRESSED => sys_key_pressed(),
+        SYSCALL_NET_BYPASS_SETUP => sys_net_bypass_setup(),
+        SYSCALL_NET_BYPASS_TX => sys_net_bypass_tx(),
+        SYSCALL_NET_BYPASS_RX => sys_net_bypass_rx(),
         _ => panic!("Unsupported syscall_id: {}", syscall_id),
     }
 }

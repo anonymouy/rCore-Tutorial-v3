@@ -1,6 +1,7 @@
+use crate::net::bypass;
 use crate::net::port_table::{PortFd, accept, listen, port_acceptable};
 use crate::net::udp::UDP;
-use crate::net::{IPv4, net_interrupt_handler};
+use crate::net::{IPv4, net_poll_handler};
 use crate::task::{current_process, current_task, current_trap_cx};
 use alloc::sync::Arc;
 
@@ -41,7 +42,7 @@ pub fn sys_accept(port_index: usize) -> isize {
 
     // NOTICE: There does not have interrupt handler, just call it munually.
     loop {
-        net_interrupt_handler();
+        net_poll_handler();
 
         if !port_acceptable(port_index) {
             break;
@@ -50,4 +51,16 @@ pub fn sys_accept(port_index: usize) -> isize {
 
     let cx = current_trap_cx();
     cx.x[10] as isize
+}
+
+pub fn sys_net_bypass_setup() -> isize {
+    bypass::bypass_setup()
+}
+
+pub fn sys_net_bypass_tx() -> isize {
+    bypass::bypass_tx()
+}
+
+pub fn sys_net_bypass_rx() -> isize {
+    bypass::bypass_rx()
 }

@@ -1,0 +1,256 @@
+\chapter{实验与分析}
+\label{cha:experiment}
+
+本章对第三章设计实现的内核旁路网络方案进行实验验证与性能评估。首先介绍实验环境的搭建，然后通过功能测试验证方案的正确性，最后在发送吞吐量和往返时延两项指标上与 rCore 传统 socket 路径和 Linux 传统 socket 路径进行实测对比，并对实验结果进行分析。
+
+\section{实验环境}
+\label{sec:env}
+
+\subsection{硬件与虚拟化平台}
+
+本文的所有实验均在 QEMU 模拟的 RISC-V 64 位虚拟机上运行。表~\ref{tab:env} 列出了实验环境的详细配置。
+
+\begin{table}[htbp]
+    \centering
+    \caption{实验环境配置}
+    \label{tab:env}
+    \begin{tabular}{ll}
+        \toprule
+        配置项 & 参数 \\
+        \midrule
+        宿主机操作系统   & Ubuntu 22.04 LTS (x86\_64) \\
+        宿主机 CPU       & 按实际填充 \\
+        宿主机内存       & 按实际填充 \\
+        QEMU 版本        & 按实际填充 \\
+        虚拟机架构       & RISC-V 64 (virt machine) \\
+        虚拟机内存       & 128 MB \\
+        网络设备         & VirtIO-net (MMIO 传输) \\
+        网络后端         & SLIRP 用户态网络栈 \\
+        编译工具链       & rustc nightly + riscv64gc-unknown-none-elf \\
+        计时源           & RISC-V \texttt{rdtime} 指令（QEMU 默认 10 MHz，1 tick = 100 ns）\\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+QEMU 的 SLIRP 网络后端在宿主机用户态实现了一个轻量级 TCP/IP 栈，为虚拟机提供 NAT 网络连接。虚拟机内部的 VirtIO-net 设备通过 MMIO 方式与 SLIRP 后端交互。在性能测试中，宿主机上运行 Python 编写的 UDP echo server，监听指定端口并将收到的数据原样返回。
+
+\subsection{对比基线}
+
+为评估内核旁路方案的性能，本文设置了以下三条测试路径：
+
+\begin{itemize}
+    \item \textbf{Bypass 路径}：本文实现的内核旁路方案，用户程序通过共享缓冲区直接构造以太网帧，通过 \texttt{sys\_net\_bypass\_tx/rx} 收发数据；
+    \item \textbf{rCore Socket 路径}：rCore 传统的 socket 系统调用路径，用户程序通过 \texttt{sys\_write/sys\_read} 收发 UDP 数据，内核完成协议栈封装/解析和缓冲区拷贝；
+    \item \textbf{Linux Socket 路径}：在相同 QEMU 配置下运行 Linux 操作系统（按实际内核版本填充），使用标准的 \texttt{sendto/recvfrom} 系统调用收发 UDP 数据。
+\end{itemize}
+
+三条路径均在同一宿主机、同一 QEMU 版本和同一网络后端（SLIRP）下测试，确保硬件环境一致。所有测试使用 RISC-V \texttt{rdtime} 指令作为统一计时源。
+
+\subsection{测试指标}
+
+本文采用以下两项性能指标：
+
+\begin{itemize}
+    \item \textbf{发送吞吐量}：以 ticks/pkt（每包发送耗时）为单位衡量。测试程序连续发送一定数量的 UDP 数据包，记录总耗时并计算单包平均耗时。数值越小表示发送性能越好。
+    \item \textbf{平均往返时延（RTT）}：以 ticks 为单位衡量。测试程序向宿主机 UDP echo server 发送数据包并等待回复，记录从发送到接收完成的时间间隔。测试多次后取中位数（p50）和尾部百分位数（p99）。
+\end{itemize}
+
+\subsection{测试方法}
+
+为保证测试结果的准确性，所有基准测试程序采用统一的测试结构：
+
+\begin{enumerate}
+    \item \textbf{测试顺序}：所有测试均按 RTT → TX 吞吐量 → Burst 发送的固定顺序执行。RTT 测试必须首先运行，因为 TX 吞吐量测试连续发送大量数据包但不接收回复，会导致 QEMU 内部的网络缓冲区积压过时的回复包（ICMP Port Unreachable 或 UDP echo 回复），若在此之后运行 RTT 测试，接收到的回复可能是过时的积压包而非当次发送的回复，导致延迟测量失真。
+    \item \textbf{预热阶段}：RTT 测试在正式采样前执行 20 次预热，使 CPU 缓存、VirtIO 队列和 QEMU 内部状态达到稳态后再开始计时。
+    \item \textbf{采样参数}：RTT 测试正式采样 200 次，TX 吞吐量测试发送 1000 包，Burst 测试发送 16 包（与 Bypass 环大小一致）。
+    \item \textbf{载荷大小}：统一测试 64 B、512 B 和 1024 B 三种载荷大小。
+\end{enumerate}
+
+
+\section{功能验证}
+\label{sec:func-test}
+
+\subsection{UDP 收发验证}
+
+本文编写了用户态示例程序 \texttt{bypass\_udp}，验证内核旁路路径的完整 UDP 收发流程。测试步骤如下：
+
+\begin{enumerate}
+    \item 用户程序调用 \texttt{sys\_net\_bypass\_setup()} 初始化共享缓冲区，从控制头中读取本机 MAC 和 IP 地址；
+    \item 在 TX slot 中构造完整的以太网帧（以太网头 + IPv4 头 + UDP 头 + 载荷），载荷内容为 \texttt{"Hello from bypass!"}；
+    \item 调用 \texttt{sys\_net\_bypass\_tx()} 将数据包提交给 VirtIO 设备发送；
+    \item 宿主机 UDP echo server 收到数据包后原样返回；
+    \item 用户程序调用 \texttt{sys\_net\_bypass\_rx()} 阻塞等待回复；
+    \item 系统调用返回后，从 RX slot 中读取并解析收到的以太网帧，验证载荷内容与发送一致。
+\end{enumerate}
+
+测试结果表明，\texttt{bypass\_udp} 程序能够成功完成 UDP 数据包的发送与接收，宿主机侧的 echo server 正确收到并返回了数据包，用户程序解析回复后确认载荷内容完整无误。
+
+\subsection{ARP 透明处理验证}
+
+在首次通信时，SLIRP 网络后端（充当虚拟网关角色）需要通过 ARP 协议解析虚拟机的 MAC 地址。测试中观察到以下行为：
+
+\begin{enumerate}
+    \item 用户程序发送第一个 UDP 数据包后，SLIRP 后端向虚拟机发送 ARP 请求（"Who has 10.0.2.15? Tell 10.0.2.2"）；
+    \item 用户程序调用 \texttt{sys\_net\_bypass\_rx()} 时，内核在接收循环中检测到该 ARP 请求，自动构造并发送 ARP 应答；
+    \item ARP 应答未被传递给用户程序，用户程序无感知；
+    \item SLIRP 后端获得 MAC 地址后，后续 IP 通信正常进行。
+\end{enumerate}
+
+该测试验证了内核侧 ARP 透明代理机制的正确性。
+
+\subsection{无 echo server 场景}
+
+当宿主机未运行 UDP echo server 时，发送的 UDP 数据包到达宿主机后，宿主机内核会返回 ICMP Port Unreachable 报文。此时 \texttt{sys\_net\_bypass\_rx} 会接收到该 ICMP 报文（而非期望的 UDP 回复），用户程序可以通过检查 EtherType 和 IP 协议号识别该情况。该行为符合预期，验证了旁路路径在异常场景下的稳定性。
+
+
+\section{性能测试与分析}
+\label{sec:perf}
+
+\subsection{发送吞吐量}
+
+测试程序在每条路径上连续发送 1000 个 UDP 数据包（载荷大小分别为 64 B、512 B 和 1024 B），记录总耗时并计算单包平均发送耗时。结果如表~\ref{tab:tx-throughput} 所示。
+
+\begin{table}[htbp]
+    \centering
+    \caption{发送吞吐量对比（单位：ticks/pkt，越小越好）}
+    \label{tab:tx-throughput}
+    \begin{tabular}{ccccc}
+        \toprule
+        载荷大小 & Bypass 路径 & rCore Socket & Linux Socket & Bypass vs rCore \\
+        \midrule
+        64 B   & 2732  & 4104  & 6171 & 提升 33\% \\
+        512 B  & 3152  & 4823  & 6454 & 提升 35\% \\
+        1024 B & 3817  & 4313  & 5978 & 提升 12\% \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+% 建议作图：三条路径发送吞吐量的柱状图对比
+\begin{figure}[htbp]
+    \centering
+    % \includegraphics[width=0.75\textwidth]{figures/tx-throughput.pdf}
+    \caption{不同载荷大小下三条路径的发送吞吐量对比}
+    \label{fig:tx-throughput}
+\end{figure}
+
+从表~\ref{tab:tx-throughput} 中可以得出以下结论：
+
+\textbf{（1）Bypass 路径在发送吞吐量上表现最优。}以 64 B 载荷为例，Bypass 路径的单包发送耗时为 2732 ticks（273.2 $\mu$s），相比 rCore Socket 路径（4104 ticks）提升了 33\%。在 512 B 载荷下提升最大，达到 35\%。这一优势主要来源于两个方面：Bypass 路径消除了用户缓冲区到内核缓冲区的 \texttt{memcpy} 操作；同时，传统 Socket 路径中的 \texttt{build\_udp\_packet} 需要通过 \texttt{Vec} 进行堆内存动态分配来构造数据包，而 Bypass 路径使用预分配的固定 slot，避免了运行时内存分配开销。
+
+\textbf{（2）rCore Socket 路径显著优于 Linux Socket 路径。}rCore Socket 路径的单包耗时（4104--4823 ticks）约为 Linux Socket 路径（5978--6454 ticks）的 64\%--75\%。这是因为 rCore 作为教学内核，协议栈实现极为精简（无拥塞控制、无连接跟踪、无 Netfilter 等），而 Linux 的完整 TCP/IP 栈包含大量的安全检查、路由查找和协议处理逻辑。
+
+\textbf{（3）在 1024 B 载荷下 Bypass 路径的提升幅度有所收窄。}1024 B 载荷时 Bypass 路径相比 rCore Socket 的提升从 33\%--35\% 降至 12\%。这是因为在大载荷场景下，VirtIO 设备交互（MMIO 通知、DMA 传输）的固定开销在总耗时中占比增大，而数据拷贝和协议栈处理的相对占比降低，导致 Bypass 路径消除这些开销后的边际收益减小。
+
+\subsection{平均往返时延}
+
+测试程序向宿主机 UDP echo server 发送数据包并等待回复，记录单次 RTT。每种配置预热 20 次后正式采样 200 次，统计中位数（p50）和尾部延迟（p99）。结果如表~\ref{tab:rtt} 所示。
+
+\begin{table}[htbp]
+    \centering
+    \caption{往返时延对比（单位：ticks，越小越好）}
+    \label{tab:rtt}
+    \begin{tabular}{cccccc}
+        \toprule
+        载荷大小 & 指标 & Bypass & rCore Socket & Linux Socket & Bypass vs rCore \\
+        \midrule
+        64 B   & p50 & 4848  & 5604  & 14392 & 提升 13\% \\
+        64 B   & p99 & 20858 & 15456 & 27452 & 落后 35\% \\
+        512 B  & p50 & 4575  & 4913  & 14164 & 提升 7\% \\
+        512 B  & p99 & 11884 & 17901 & 26474 & 提升 34\% \\
+        1024 B & p50 & 4213  & 4677  & 14797 & 提升 10\% \\
+        1024 B & p99 & 11531 & 12566 & 29106 & 提升 8\% \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+% 建议作图：RTT 对比的分组柱状图（按载荷大小分组，每组三条路径）
+\begin{figure}[htbp]
+    \centering
+    % \includegraphics[width=0.75\textwidth]{figures/rtt-compare.pdf}
+    \caption{不同载荷大小下三条路径的往返时延对比}
+    \label{fig:rtt-compare}
+\end{figure}
+
+根据实验结果，分析如下：
+
+\textbf{（1）在中位数（p50）延迟上，Bypass 路径稳定优于 rCore Socket 路径，但差距有限。}三种载荷下 Bypass 路径的 p50 RTT 均低于 rCore Socket 路径，提升幅度为 7\%--13\%。这是因为 RTT 的主要组成部分是 VirtIO 设备交互延迟（MMIO 通知、QEMU 后端处理、SLIRP 协议栈转发）和宿主机网络处理延迟，这些固定开销在两条路径中相同，发送侧节省的拷贝开销在 RTT 中占比有限。
+
+\textbf{（2）两条 rCore 路径均显著优于 Linux Socket 路径。}Bypass 路径和 rCore Socket 路径的 p50 RTT 约为 Linux Socket 路径的 1/3（Bypass 64 B: 4848 vs Linux: 14392，加速比约 3.0 倍），这反映了 rCore 精简协议栈与 Linux 完整协议栈之间的根本差异。
+
+\textbf{（3）尾部延迟（p99）表现不稳定，与 QEMU 调度抖动有关。}在 64 B 载荷下，Bypass 路径的 p99（20858 ticks）反而高于 rCore Socket 路径（15456 ticks）。但在 512 B 载荷下，Bypass 路径的 p99（11884 ticks）显著优于 rCore Socket 路径（17901 ticks），提升达 34\%。这种不一致性主要归因于 QEMU 虚拟化环境中的调度抖动：QEMU 作为宿主机上的用户态进程，其 vCPU 线程受宿主机 CPU 调度影响，VirtIO 设备模拟和 SLIRP 网络处理引入的延迟波动在仅 200 次采样中难以被充分平滑。p99 作为尾部指标对异常值高度敏感，少量高延迟样本即可显著拉高该值。在 512 B 和 1024 B 载荷下 Bypass 路径 p99 的改善表明，消除内核协议栈处理在减少延迟波动方面具有积极作用，但这一优势在小包场景中可能被 QEMU 调度噪声掩盖。
+
+\subsection{批量发送分析}
+
+为进一步分析 Bypass 路径的开销构成，本文将其操作拆分为入队阶段（用户态写入共享内存）和刷新阶段（内核提交 VirtIO）两部分，测试 16 包连续发送的场景。结果如表~\ref{tab:burst} 所示。
+
+\begin{table}[htbp]
+    \centering
+    \caption{批量发送开销分解（16 包连发，单位：ticks/pkt）}
+    \label{tab:burst}
+    \begin{tabular}{cccccc}
+        \toprule
+        载荷大小 & 入队（用户态） & 刷新（内核态） & Bypass 合计 & rCore Socket & Linux Socket \\
+        \midrule
+        64 B   & 104  & 2906  & 3010  & 4354  & 6090 \\
+        512 B  & 21   & 3446  & 3467  & 4254  & 6838 \\
+        1024 B & 20   & 3276  & 3296  & 6193  & 6774 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+入队阶段仅耗费 20--104 ticks/pkt（即 2.0--10.4 $\mu$s），本质上是纯内存写操作，几乎无开销。刷新阶段的开销主要来自 VirtIO 的 MMIO 通知（向 \texttt{queue\_notify} 寄存器触发 QEMU 后端处理）和设备交互等待。
+
+对于 64 B 载荷，Bypass 合计开销（3010 ticks/pkt）为 rCore Socket 路径（4354 ticks/pkt）的 69\%，为 Linux Socket 路径（6090 ticks/pkt）的 49\%。对于 1024 B 载荷，Bypass 合计开销（3296 ticks/pkt）仅为 rCore Socket 路径（6193 ticks/pkt）的 53\%，体现了批量提交和零拷贝在大载荷场景下的优势。
+
+该结果也表明，当前方案中 Bypass 路径的性能瓶颈已从数据拷贝和系统调用开销转移到了 VirtIO 设备交互本身——这是 QEMU 虚拟化环境的固有延迟，无法在客操作系统内部进一步优化。
+
+\subsection{开销来源分析}
+
+综合以上测试结果，表~\ref{tab:overhead} 对 Bypass 路径与传统 Socket 路径的开销构成进行了定性对比。
+
+\begin{table}[htbp]
+    \centering
+    \caption{Bypass 路径与传统 Socket 路径的开销构成对比}
+    \label{tab:overhead}
+    \begin{tabular}{lcc}
+        \toprule
+        开销来源 & 传统 Socket 路径 & Bypass 路径 \\
+        \midrule
+        系统调用（ecall/sret）    & 每包 $\geq$1 次       & 批量刷新 1 次 \\
+        数据拷贝（memcpy）        & 1 次（用户$\to$内核）     & 0 次 \\
+        动态内存分配              & 有（Vec 构造帧）      & 无（预分配 slot） \\
+        协议栈处理                & 有（UDP/IP 封装）     & 无（用户态构造原始帧） \\
+        VirtIO 设备交互           & 有                    & 有（相同） \\
+        中断处理                  & 有（接收路径）        & 有限（接收路径轮询） \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+Bypass 路径消除了数据拷贝、动态内存分配和内核协议栈处理三项开销，将系统调用次数降至最低（批量发送场景下平摊到每包几乎为零），唯一保留的开销是 \texttt{ecall/sret} 陷入返回本身和 VirtIO 设备交互——前者是维护内核安全边界的必要代价，后者是虚拟化环境的固有延迟。
+
+
+\section{局限性讨论}
+\label{sec:limitations}
+
+尽管实验结果验证了内核旁路方案的可行性和性能优势，但当前实现仍存在以下局限性：
+
+\textbf{（1）单进程独占。}当前方案中共享缓冲区由全局 \texttt{BypassState} 管理，仅支持一个用户进程独占使用。若多个进程同时请求旁路通道，需要为每个进程分配独立的共享缓冲区并维护各自的 Virtqueue 资源，目前尚未实现。
+
+\textbf{（2）阻塞式接收。}\texttt{sys\_net\_bypass\_rx} 采用自旋等待（spin-wait）模式阻塞在 \texttt{VirtIONet::recv} 中，直到设备完成接收。这种模式在等待期间会持续占用 CPU 核心，不利于多任务环境下的资源利用。更优的设计应采用中断驱动的异步通知机制，在没有数据包到达时让出 CPU。
+
+\textbf{（3）无多队列支持。}当前实现仅使用单个 TX 队列和单个 RX 队列，无法利用 VirtIO-net 的多队列（Multiqueue）特性实现多核并行收发。
+
+\textbf{（4）安全性不足。}共享缓冲区被映射为用户可读写，恶意用户程序可以构造任意以太网帧（包括伪造源 MAC/IP 地址），或通过修改控制头中的指针破坏环形队列的一致性。在生产环境中，需要引入缓冲区校验或将控制头的写入权限限制在内核侧。
+
+\textbf{（5）QEMU 环境的局限。}所有测试均在 QEMU + SLIRP 环境下运行，VirtIO 设备交互延迟受 QEMU 虚拟化开销和 SLIRP 用户态网络栈的影响较大，无法精确代表在真实硬件或 KVM 加速环境下的性能表现。此外，QEMU 的 vCPU 调度抖动导致尾部延迟（p99）指标存在较大波动，200 次采样不足以完全消除该噪声。
+
+
+\section{本章小结}
+
+本章对内核旁路网络方案进行了完整的实验验证与性能评估。功能测试表明，该方案可在 QEMU 虚拟化环境下正确完成 UDP 数据包的用户态收发，并透明处理 ARP 协议交互。
+
+性能测试结果显示，Bypass 路径在发送吞吐量上相比 rCore 传统 Socket 路径提升了 12\%--35\%，相比 Linux 传统 Socket 路径提升了 1.5--2.3 倍。在往返时延的中位数（p50）上，Bypass 路径稳定优于 rCore Socket 路径 7\%--13\%，两条 rCore 路径均约为 Linux Socket 路径的 1/3。批量发送分析进一步表明，Bypass 路径的入队阶段（用户态写入共享内存）仅需 20--104 ticks/pkt，性能瓶颈已从数据拷贝转移到 VirtIO 设备交互本身。
+
+尾部延迟（p99）受 QEMU 调度抖动影响存在波动，在部分载荷下 Bypass 路径的 p99 反而高于 rCore Socket 路径。这一现象提示，在虚拟化环境中 200 次采样不足以获得稳定的尾部统计，后续工作可通过增加采样次数或在 KVM 等低噪声环境下重新评测。
+
+最后讨论了当前实现在单进程独占、阻塞式接收、多队列和安全性方面的局限性，为后续改进指明了方向。

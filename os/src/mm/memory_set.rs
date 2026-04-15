@@ -241,6 +241,12 @@ impl MemorySet {
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.page_table.translate(vpn)
     }
+    /// Map a single page directly without tracking in `areas`.
+    /// The caller must ensure the physical frame stays alive.
+    pub fn map_page_direct(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, perm: MapPermission) {
+        let pte_flags = PTEFlags::from_bits(perm.bits).unwrap();
+        self.page_table.map(vpn, ppn, pte_flags);
+    }
     pub fn recycle_data_pages(&mut self) {
         //*self = Self::new_bare();
         self.areas.clear();

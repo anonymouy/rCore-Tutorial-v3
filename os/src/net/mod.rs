@@ -1,3 +1,4 @@
+pub mod bypass;
 pub mod port_table;
 pub mod socket;
 pub mod tcp;
@@ -132,7 +133,7 @@ pub fn build_udp_packet(
 }
 
 /// Build an ARP reply frame.
-fn build_arp_reply(
+pub(super) fn build_arp_reply(
     our_mac: &MacAddress,
     our_ip: &IPv4,
     target_mac: &MacAddress,
@@ -425,8 +426,8 @@ lazy_static::lazy_static! {
 // Interrupt handler — parse raw frame
 // ============================================================
 
-pub fn net_interrupt_handler() {
-    let mut recv_buf = vec![0u8; 1024];
+pub fn net_poll_handler() {
+    let mut recv_buf = vec![0u8; 2048];
     let len = NET_DEVICE.receive(&mut recv_buf);
 
     match parse_packet(&recv_buf[..len]) {

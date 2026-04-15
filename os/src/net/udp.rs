@@ -2,7 +2,7 @@ use crate::drivers::NET_DEVICE;
 use crate::fs::File;
 use alloc::vec;
 
-use super::net_interrupt_handler;
+use super::net_poll_handler;
 use super::socket::{add_socket, pop_data, remove_socket};
 use super::{build_udp_packet, IPv4, MacAddress, NET_CONFIG};
 
@@ -53,7 +53,7 @@ impl File for UDP {
                 }
                 return left;
             } else {
-                net_interrupt_handler();
+                net_poll_handler();
             }
         }
     }

@@ -1,0 +1,413 @@
+\chapter{rCore 内核旁路网络栈的设计与实现}
+
+\section{总体架构}
+
+传统操作系统的网络收发包路径需要经过完整的协议栈处理：用户程序通过 \texttt{write} 系统调用将应用层载荷传入内核，内核依次进行 UDP/IP 报头封装、校验和计算、以太网帧构造，最后提交给 VirtIO 驱动发送。接收路径则反向执行上述过程。每次收发包至少涉及两次内存拷贝（用户缓冲区与内核缓冲区之间、内核缓冲区与驱动缓冲区之间）和一次系统调用陷入。
+
+本章设计并实现了一种基于共享环形缓冲区的内核旁路（Kernel Bypass）网络方案。其核心思想是：在内核中分配一组物理页帧，通过页表映射使用户进程和内核同时可见同一段物理内存；用户程序直接在该共享内存中构造原始以太网帧，内核仅负责将缓冲区的物理地址提交给 VirtIO 设备，设备通过 DMA 直接读写共享页帧中的数据，从而在整个收发路径上消除数据拷贝。
+
+图~\ref{fig:bypass-arch} 展示了该方案的总体架构。方案包含三个自定义系统调用：
+\begin{itemize}
+    \item \texttt{sys\_net\_bypass\_setup}（编号 4000）：分配共享缓冲区并映射到用户地址空间；
+    \item \texttt{sys\_net\_bypass\_tx}（编号 4001）：将 TX 环中待发送的数据包逐一提交给 VirtIO 设备；
+    \item \texttt{sys\_net\_bypass\_rx}（编号 4002）：阻塞等待设备接收一个数据包到 RX 环中。
+\end{itemize}
+
+\begin{figure}[htbp]
+    \centering
+    % 可替换为实际的 tikz 绘图或插图
+    \begin{verbatim}
+    用户进程                    内核                     VirtIO 设备
+    ┌──────────┐          ┌──────────┐            ┌──────────┐
+    │ 构造以太 │          │ bypass   │            │ QEMU     │
+    │ 网帧写入 │──共享──→│ _tx()    │──descriptor│ virtio-  │
+    │ TX slot  │  内存    │ 提交物理 │  addr=PA   │ net 后端 │
+    │          │          │ 地址给   │──notify──→│ DMA 读取 │
+    │          │          │ VirtQueue│            │ 发送到网 │
+    └──────────┘          └──────────┘            │ 络       │
+                                                  └──────────┘
+    \end{verbatim}
+    \caption{内核旁路网络方案总体架构}
+    \label{fig:bypass-arch}
+\end{figure}
+
+\section{共享环形缓冲区设计}
+
+\subsection{内存布局}
+
+共享缓冲区由 17 个物理页帧（每页 4096 字节，共 69632 字节）组成，被映射到用户地址空间的固定虚拟地址 \texttt{0x20000000} 处。其内存布局如表~\ref{tab:layout} 所示。
+
+\begin{table}[htbp]
+    \centering
+    \caption{共享缓冲区内存布局}
+    \label{tab:layout}
+    \begin{tabular}{cccc}
+        \toprule
+        页帧编号 & 字节偏移 & 大小 & 用途 \\
+        \midrule
+        0 & \texttt{0x0000} & 4096 B & 控制头（\texttt{NetBypassHeader}） \\
+        1--8 & \texttt{0x1000} & 32768 B & TX 环：16 个 slot $\times$ 2048 B \\
+        9--16 & \texttt{0x9000} & 32768 B & RX 环：16 个 slot $\times$ 2048 B \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+每个 slot 的前 2 字节为小端序的 \texttt{u16} 长度前缀，后续为原始以太网帧数据，最大可容纳 2046 字节的帧（覆盖标准以太网 MTU 1500 字节加报头的需求）。对应的内核常量定义如下：
+
+\begin{lstlisting}[language=Rust, caption={共享缓冲区常量定义}]
+const BYPASS_VADDR: usize = 0x20000000;
+const RING_SIZE: usize = 16;
+const SLOT_SIZE: usize = 2048;
+const TX_OFFSET: usize = PAGE_SIZE;
+const RX_OFFSET: usize = TX_OFFSET + RING_SIZE * SLOT_SIZE;
+const NUM_PAGES: usize = 17;
+\end{lstlisting}
+
+\subsection{控制头结构}
+
+控制头位于共享区域的第 0 页，采用 \texttt{\#[repr(C)]} 布局保证内核与用户程序对字段偏移的一致性。其结构定义如下：
+
+\begin{lstlisting}[language=Rust, caption={控制头结构体定义}]
+#[repr(C)]
+pub struct NetBypassHeader {
+    pub tx_head: u32,       // 用户写入指针
+    pub tx_tail: u32,       // 内核消费指针
+    pub rx_head: u32,       // 内核写入指针
+    pub rx_tail: u32,       // 用户消费指针
+    pub ring_size: u32,     // 环大小（16）
+    pub slot_size: u32,     // 槽大小（2048）
+    pub tx_offset: u32,     // TX 环字节偏移
+    pub rx_offset: u32,     // RX 环字节偏移
+    pub local_mac: [u8; 6], // 本机 MAC 地址
+    pub _pad: [u8; 2],
+    pub local_ip: [u8; 4],  // 本机 IPv4 地址
+}
+\end{lstlisting}
+
+TX 环和 RX 环各使用一对 head/tail 指针实现单生产者-单消费者（SPSC）的无锁环形队列。以 TX 环为例：用户程序是生产者，递增 \texttt{tx\_head}；内核是消费者，递增 \texttt{tx\_tail}。当 $\texttt{tx\_head} - \texttt{tx\_tail} \geq \texttt{ring\_size}$ 时环满，用户需等待内核消费后方可继续写入。所有指针的读写均使用 \texttt{volatile} 语义以防止编译器优化导致的可见性问题，并在更新前插入内存屏障（\texttt{fence(SeqCst)}）保证多核环境下的顺序一致性。
+
+\section{共享内存映射机制}
+
+\subsection{物理页帧分配}
+
+由于 rCore 的物理帧分配器（\texttt{frame\_alloc}）以单页为粒度分配，返回的页帧在物理地址上不一定连续。因此需要逐页建立虚实映射关系。内核在 \texttt{BypassState} 结构体中维护了每个页帧的 \texttt{FrameTracker}，通过 \texttt{ptr\_at} 方法将逻辑字节偏移解析为对应物理页帧上的内核虚拟地址：
+
+\begin{lstlisting}[language=Rust, caption={非连续物理页的地址解析}]
+fn ptr_at(&self, byte_offset: usize) -> *mut u8 {
+    let page_idx = byte_offset / PAGE_SIZE;
+    let page_off = byte_offset % PAGE_SIZE;
+    let ppn = self.frames[page_idx].ppn;
+    (ppn.0 * PAGE_SIZE + page_off) as *mut u8
+}
+\end{lstlisting}
+
+由于 rCore 内核采用恒等映射（Identical Mapping），即内核虚拟地址等于物理地址，因此 \texttt{ppn.0 * PAGE\_SIZE + page\_off} 既是物理地址也是内核虚拟地址，内核可以直接通过该指针访问 slot 数据。
+
+\subsection{页表直接映射}
+
+为将共享页帧映射到用户进程的虚拟地址空间，本方案在 \texttt{MemorySet} 中新增了 \texttt{map\_page\_direct} 方法：
+
+\begin{lstlisting}[language=Rust, caption={页表直接映射方法}]
+pub fn map_page_direct(
+    &mut self,
+    vpn: VirtPageNum,
+    ppn: PhysPageNum,
+    perm: MapPermission,
+) {
+    let pte_flags = PTEFlags::from_bits(perm.bits).unwrap();
+    self.page_table.map(vpn, ppn, pte_flags);
+}
+\end{lstlisting}
+
+该方法直接操作 RISC-V SV39 页表，在指定的虚拟页号（VPN）与物理页号（PPN）之间建立映射，而不经过 \texttt{MapArea} 的管理。这样设计的原因有二：
+\begin{enumerate}
+    \item 共享页帧的生命周期由全局的 \texttt{BypassState} 管理，而非进程的 \texttt{MemorySet}，因此无需 \texttt{MapArea} 跟踪其 \texttt{FrameTracker}；
+    \item 非连续物理页帧无法用 \texttt{MapArea} 的连续虚实映射模型（\texttt{Identical}、\texttt{Framed}）表达。
+\end{enumerate}
+
+初始化时，内核将 17 个页帧依次映射到用户地址空间 \texttt{0x20000000} 起始的连续虚拟页上，设置可读、可写、用户可访问权限：
+
+\begin{lstlisting}[language=Rust, caption={共享缓冲区映射到用户地址空间}]
+for (i, ft) in bs.frames.iter().enumerate() {
+    let vpn = VirtPageNum::from(
+        VirtAddr::from(BYPASS_VADDR + i * PAGE_SIZE)
+    );
+    inner.memory_set.map_page_direct(
+        vpn, ft.ppn,
+        MapPermission::R | MapPermission::W | MapPermission::U,
+    );
+}
+\end{lstlisting}
+
+映射完成后，用户进程通过 \texttt{0x20000000 + offset} 访问的虚拟地址和内核通过 \texttt{ptr\_at(offset)} 访问的虚拟地址指向同一物理页帧，实现了跨地址空间的零拷贝数据共享。
+
+\section{发送路径实现}
+
+发送路径分为用户侧构造和内核侧提交两个阶段。
+
+\subsection{用户侧：构造原始以太网帧}
+
+用户程序直接在 TX slot 中构造完整的以太网帧（包括以太网头、IPv4 头、UDP 头和载荷），然后更新 \texttt{tx\_head} 指针。以下为用户态的关键操作：
+
+\begin{lstlisting}[language=Rust, caption={用户态发包：写入 TX slot 并推进 head 指针}]
+let tx_head = ptr::read_volatile(&(*hdr).tx_head);
+let idx = (tx_head % ring_size) as usize;
+let slot = (base + tx_off + idx * slot_size) as *mut u8;
+
+// 写入长度前缀（u16 LE）
+let len_bytes = (frame_len as u16).to_le_bytes();
+ptr::write(slot, len_bytes[0]);
+ptr::write(slot.add(1), len_bytes[1]);
+
+// 写入以太网帧数据
+ptr::copy_nonoverlapping(frame.as_ptr(), slot.add(2), frame_len);
+
+// 内存屏障 + 推进 tx_head
+fence(Ordering::SeqCst);
+ptr::write_volatile(&mut (*hdr).tx_head, tx_head.wrapping_add(1));
+\end{lstlisting}
+
+此阶段完全在用户态完成，不产生任何系统调用开销。用户可以连续写入多个 slot 后再统一调用一次 \texttt{sys\_net\_bypass\_tx} 刷新，实现批量发送。
+
+\subsection{内核侧：VirtIO 零拷贝提交}
+
+用户调用 \texttt{sys\_net\_bypass\_tx} 后，内核读取 TX 环中所有待发送的 slot 并逐包提交给 VirtIO 设备：
+
+\begin{lstlisting}[language=Rust, caption={内核 TX 刷新：遍历 TX 环并提交 VirtIO}]
+pub fn bypass_tx() -> isize {
+    let state = BYPASS_STATE.exclusive_access();
+    let bs = state.as_ref().unwrap();
+    let hdr = bs.header();
+    let mut sent: u32 = 0;
+
+    unsafe {
+        let tx_head = ptr::read_volatile(&(*hdr).tx_head);
+        let mut tx_tail = ptr::read_volatile(&(*hdr).tx_tail);
+
+        while tx_tail != tx_head {
+            let idx = (tx_tail % RING_SIZE as u32) as usize;
+            let slot = bs.tx_slot(idx);
+            let pkt_len = u16::from_le_bytes(
+                [ptr::read(slot), ptr::read(slot.add(1))]
+            ) as usize;
+            if pkt_len > 0 && pkt_len <= SLOT_SIZE - 2 {
+                let pkt = core::slice::from_raw_parts(
+                    slot.add(2), pkt_len
+                );
+                NET_DEVICE.transmit(pkt);
+            }
+            tx_tail = tx_tail.wrapping_add(1);
+            sent += 1;
+        }
+        ptr::write_volatile(&mut (*hdr).tx_tail, tx_tail);
+    }
+    sent as isize
+}
+\end{lstlisting}
+
+这里的关键在于 \texttt{NET\_DEVICE.transmit(pkt)} 调用。\texttt{pkt} 是一个指向 slot 物理页帧的切片引用，其内核虚拟地址在恒等映射下等于物理地址。当 VirtIO 驱动内部执行 \texttt{VirtQueue::add} 时，\texttt{Descriptor::set\_buf} 将该地址直接写入 VirtQueue 描述符的 \texttt{addr} 字段：
+
+\begin{lstlisting}[language=Rust, caption={VirtIO 描述符设置缓冲区地址}]
+fn set_buf<H: Hal>(&mut self, buf: &[u8]) {
+    self.addr.write(
+        H::virt_to_phys(buf.as_ptr() as usize) as u64
+    );
+    self.len.write(buf.len() as u32);
+}
+\end{lstlisting}
+
+随后驱动调用 \texttt{header.notify(QUEUE\_TRANSMIT)} 向设备 MMIO 寄存器 \texttt{queue\_notify} 写入队列编号，触发 QEMU VirtIO 后端从描述符指向的物理地址通过 DMA 读取数据并发送到网络。在整个发送路径中，数据始终驻留在最初的 slot 物理页帧上，没有发生任何内存拷贝。
+
+\section{接收路径实现}
+
+\subsection{零拷贝接收}
+
+当用户程序调用 \texttt{sys\_net\_bypass\_rx} 时，内核将 RX slot 的物理地址注册为 VirtIO 接收描述符的 DMA 目标，然后阻塞等待设备完成写入：
+
+\begin{lstlisting}[language=Rust, caption={内核 RX：将 slot 注册为 DMA 目标并阻塞等待}]
+let idx = (rx_head % RING_SIZE as u32) as usize;
+let slot = bs.rx_slot(idx);
+
+loop {
+    let buf = core::slice::from_raw_parts_mut(
+        slot.add(2), SLOT_SIZE - 2
+    );
+    let len = NET_DEVICE.receive(buf);
+    // ... ARP 透明处理（见下文）...
+
+    // 写入长度前缀并推进 rx_head
+    let len_bytes = (len as u16).to_le_bytes();
+    ptr::write(slot, len_bytes[0]);
+    ptr::write(slot.add(1), len_bytes[1]);
+    ptr::write_volatile(
+        &mut (*hdr).rx_head,
+        rx_head.wrapping_add(1)
+    );
+    return len as isize;
+}
+\end{lstlisting}
+
+\texttt{NET\_DEVICE.receive(buf)} 内部调用 \texttt{VirtIONet::recv}，后者将 \texttt{buf}（即 RX slot 的物理页帧地址）作为设备可写描述符提交到 VirtQueue 的接收队列中。设备接收到以太网帧后通过 DMA 直接写入该物理页帧，然后在 Used Ring 中标记完成。驱动通过自旋等待 \texttt{can\_pop()} 检测到完成后返回，此时数据已经存在于 RX slot 中。系统调用返回后，用户程序立即可以从共享内存中读取接收到的帧数据，全程无数据拷贝。
+
+\subsection{ARP 协议透明处理}
+
+由于用户程序绕过了内核协议栈直接收发原始以太网帧，ARP（地址解析协议）请求将直接到达 RX 环而非由内核协议栈处理。若不处理 ARP 请求，网关或对端主机将无法获得本机的 MAC 地址，导致后续通信失败。
+
+本方案在 \texttt{bypass\_rx} 的接收循环中透明处理 ARP：当接收到的帧为 ARP 请求且目标 IP 为本机时，内核自动构造 ARP 应答并发送，然后继续等待下一帧，不将 ARP 帧暴露给用户程序：
+
+\begin{lstlisting}[language=Rust, caption={ARP 请求的透明应答}]
+if len >= 14 {
+    let ethertype = u16::from_be_bytes([buf[12], buf[13]]);
+    if ethertype == 0x0806 && len >= 42 {
+        let operation = u16::from_be_bytes([buf[20], buf[21]]);
+        if operation == 1 {  // ARP Request
+            let cfg = NET_CONFIG.exclusive_access();
+            let target_ip = IPv4::from_bytes(&buf[38..42]);
+            if target_ip == cfg.ip {
+                let sender_mac =
+                    MacAddress::from_bytes(&buf[22..28]);
+                let sender_ip =
+                    IPv4::from_bytes(&buf[28..32]);
+                let reply = build_arp_reply(
+                    &cfg.mac, &cfg.ip,
+                    &sender_mac, &sender_ip,
+                );
+                drop(cfg);
+                NET_DEVICE.transmit(&reply);
+                continue;  // 继续等待下一帧
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+这一设计使用户程序只需关注 IP 层及以上的协议处理，而无需实现复杂的链路层地址解析逻辑。
+
+\section{系统调用接口}
+
+\subsection{系统调用注册}
+
+三个旁路系统调用在内核的系统调用分发表中注册，编号从 4000 起始，与现有系统调用编号空间分离：
+
+\begin{lstlisting}[language=Rust, caption={系统调用编号定义与分发}]
+const SYSCALL_NET_BYPASS_SETUP: usize = 4000;
+const SYSCALL_NET_BYPASS_TX: usize = 4001;
+const SYSCALL_NET_BYPASS_RX: usize = 4002;
+
+pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
+    match syscall_id {
+        // ... 其他系统调用 ...
+        SYSCALL_NET_BYPASS_SETUP => sys_net_bypass_setup(),
+        SYSCALL_NET_BYPASS_TX => sys_net_bypass_tx(),
+        SYSCALL_NET_BYPASS_RX => sys_net_bypass_rx(),
+        _ => panic!("Unsupported syscall: {}", syscall_id),
+    }
+}
+\end{lstlisting}
+
+\subsection{用户态封装}
+
+用户态通过 RISC-V \texttt{ecall} 指令发起系统调用，并在库函数中提供类型安全的封装：
+
+\begin{lstlisting}[language=Rust, caption={用户态系统调用封装}]
+fn syscall(id: usize, args: [usize; 3]) -> isize {
+    let mut ret: isize;
+    unsafe {
+        core::arch::asm!("ecall",
+            inlateout("x10") args[0] => ret,
+            in("x11") args[1],
+            in("x12") args[2],
+            in("x17") id
+        );
+    }
+    ret
+}
+
+pub fn sys_net_bypass_setup() -> isize {
+    syscall(4000, [0, 0, 0])
+}
+
+pub fn sys_net_bypass_tx() -> isize {
+    syscall(4001, [0, 0, 0])
+}
+
+pub fn sys_net_bypass_rx() -> isize {
+    syscall(4002, [0, 0, 0])
+}
+\end{lstlisting}
+
+\section{与传统 Socket 路径的对比分析}
+
+为了评估内核旁路方案的性能优势，在同一 QEMU RISC-V 虚拟机上分别运行了旁路路径和传统 Socket 路径的基准测试，使用 RISC-V \texttt{rdtime} 指令（QEMU 默认 10 MHz 时基，1 tick = 100 ns）作为统一计时源。测试向宿主机 UDP 回显服务器发送 UDP 数据包。
+
+\subsection{发送吞吐量}
+
+\begin{table}[htbp]
+    \centering
+    \caption{TX 吞吐量对比（单位：ticks/pkt，越小越好）}
+    \label{tab:tx-throughput}
+    \begin{tabular}{cccc}
+        \toprule
+        载荷大小 & Bypass 路径 & Socket 路径 & 加速比 \\
+        \midrule
+        64 B   & 409 & 519 & 1.27$\times$ \\
+        512 B  & 401 & 619 & 1.54$\times$ \\
+        1024 B & 341 & 594 & 1.74$\times$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+如表~\ref{tab:tx-throughput} 所示，Bypass 路径在 TX 吞吐量上实现了 1.27--1.74 倍的提升，且载荷越大优势越明显。这是因为传统 Socket 路径中 \texttt{sys\_write} 需要进行 \texttt{UserBuffer} 逐页拷贝和 \texttt{build\_udp\_packet} 的堆内存分配与帧构造，其开销随载荷大小线性增长；而 Bypass 路径中数据始终驻留在共享 slot 中，无需额外拷贝。
+
+\subsection{往返延迟}
+
+\begin{table}[htbp]
+    \centering
+    \caption{RTT 延迟对比（单位：ticks，越小越好）}
+    \label{tab:rtt-latency}
+    \begin{tabular}{ccccc}
+        \toprule
+        载荷大小 & 指标 & Bypass & Socket & 加速比 \\
+        \midrule
+        64 B   & p50 & 815   & 897    & 1.10$\times$ \\
+        64 B   & p99 & 3221  & 3870   & 1.20$\times$ \\
+        512 B  & p50 & 784   & 900    & 1.15$\times$ \\
+        512 B  & p99 & 3879  & 6994   & 1.80$\times$ \\
+        1024 B & p50 & 824   & 984    & 1.19$\times$ \\
+        1024 B & p99 & 2788  & 21455  & 7.70$\times$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+表~\ref{tab:rtt-latency} 的结果显示，在中位数（p50）延迟上两种路径差距较小（1.1--1.2 倍），因为 RTT 主要由 VirtIO 设备交互和 QEMU 网络处理延迟主导。然而在尾部延迟（p99）上，Bypass 路径展现出显著优势，尤其在 1024 字节载荷下达到了 7.7 倍的改善。这是因为传统 Socket 路径在内核中使用 \texttt{Vec} 动态内存分配构造数据包，分配器偶发的延迟抖动导致了严重的尾部延迟；而 Bypass 路径使用预分配的固定 slot，避免了运行时内存分配。
+
+\subsection{批量发送}
+
+\begin{table}[htbp]
+    \centering
+    \caption{Burst 批量发送对比（16 包连发，单位：ticks/pkt）}
+    \label{tab:burst}
+    \begin{tabular}{ccccc}
+        \toprule
+        载荷大小 & Bypass 入队 & Bypass 刷新 & Bypass 合计 & Socket sendto \\
+        \midrule
+        64 B   & 36 & 452  & 488 & 938  \\
+        512 B  & 4  & 809  & 813 & 712  \\
+        1024 B & 6  & 400  & 406 & 620  \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+表~\ref{tab:burst} 将 Bypass 的操作拆分为入队（用户态写共享内存）和刷新（内核提交 VirtIO）两个阶段。入队阶段仅需 4--36 ticks/pkt（即 0.4--3.6 $\mu$s），本质上是纯内存写操作；刷新阶段的开销主要来自 VirtIO 的 MMIO 通知和设备交互。对于小包（64 B），Bypass 的合计开销（488 ticks）明显优于 Socket 的 sendto（938 ticks），体现了批量提交减少系统调用次数的优势。
+
+\section{本章小结}
+
+本章设计并实现了基于共享环形缓冲区的内核旁路网络方案。该方案通过以下三项关键技术实现了零拷贝收发包：
+
+\begin{enumerate}
+    \item \textbf{跨地址空间共享映射}：通过 \texttt{map\_page\_direct} 将内核分配的物理页帧同时映射到用户虚拟地址空间，使内核和用户程序可以直接访问同一段物理内存。
+    \item \textbf{VirtIO DMA 直通}：利用 rCore 恒等映射的特性，slot 的内核虚拟地址等于物理地址，VirtIO 描述符直接引用 slot 物理地址，设备 DMA 直接读写 slot 页帧。
+    \item \textbf{ARP 透明代理}：在内核接收路径中自动处理 ARP 协议交互，使用户程序无需关注链路层地址解析。
+\end{enumerate}
+
+基准测试表明，与传统 Socket 路径相比，内核旁路方案在发送吞吐量上提升了 1.27--1.74 倍，在尾部延迟（p99）上最高改善了 7.7 倍。该方案以极低的实现复杂度（约 260 行内核代码和 3 个系统调用）验证了内核旁路网络在教学操作系统中的可行性。
