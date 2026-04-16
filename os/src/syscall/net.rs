@@ -1,4 +1,3 @@
-use crate::net::bypass;
 use crate::net::port_table::{PortFd, accept, listen, port_acceptable};
 use crate::net::udp::UDP;
 use crate::net::{IPv4, net_poll_handler};
@@ -51,16 +50,4 @@ pub fn sys_accept(port_index: usize) -> isize {
 
     let cx = current_trap_cx();
     cx.x[10] as isize
-}
-
-pub fn sys_net_bypass_setup() -> isize {
-    bypass::bypass_setup()
-}
-
-pub fn sys_net_bypass_tx() -> isize {
-    bypass::bypass_tx()
-}
-
-pub fn sys_net_bypass_rx() -> isize {
-    bypass::bypass_rx()
 }

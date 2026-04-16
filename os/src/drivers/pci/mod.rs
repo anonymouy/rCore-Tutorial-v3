@@ -71,13 +71,33 @@ pub fn pci_find_device(vendor: u16, device: u16) -> Option<PciDeviceInfo> {
     None
 }
 
-/// Enable memory space access and bus mastering for the given device.
+/// Probe the size of a 32-bit memory BAR by writing all-ones and reading back.
+/// Returns 0 if the BAR is unimplemented. Restores the original value.
+pub fn pci_bar_size(bus: u8, dev: u8, func: u8, bar_off: u16) -> u32 {
+    let orig = pci_read32(bus, dev, func, bar_off);
+    pci_write32(bus, dev, func, bar_off, 0xFFFF_FFFF);
+    let probe = pci_read32(bus, dev, func, bar_off);
+    pci_write32(bus, dev, func, bar_off, orig); // restore
+    if probe == 0 {
+        return 0;
+    }
+    // Low 4 bits are type/flags; size = (~(probe & !0xF)) + 1
+    (!(probe & !0xF)).wrapping_add(1)
+}
+
+/// Assign an MMIO base address to a 32-bit memory BAR.
+pub fn pci_assign_bar(bus: u8, dev: u8, func: u8, bar_off: u16, base: u32) {
+    pci_write32(bus, dev, func, bar_off, base);
+}
+
+/// Enable Memory Space access (bit 1) and Bus Master (bit 2) for the device.
+/// Writes 0 into the Status half of the 0x04 DWORD — Status is RW1C, so 0
+/// preserves all status bits (unlike the old code which read-and-wrote
+/// them back, potentially clearing latched error bits).
 pub fn pci_enable_device(bus: u8, dev: u8, func: u8) {
-    let cmd = pci_read16(bus, dev, func, 0x04);
-    // Bit 1: Memory Space, Bit 2: Bus Master
-    let new_cmd = cmd | 0x06;
-    // Write back via 32-bit aligned access (offset 0x04 is 32-bit aligned)
-    let upper = pci_read16(bus, dev, func, 0x06);
-    let val = (new_cmd as u32) | ((upper as u32) << 16);
-    pci_write32(bus, dev, func, 0x04, val);
+    let word = pci_read32(bus, dev, func, 0x04);
+    let cmd = (word & 0xFFFF) as u16;
+    let new_cmd = cmd | 0x06; // Memory Space | Bus Master
+    let new_word = new_cmd as u32; // high 16 bits = 0 -> Status preserved
+    pci_write32(bus, dev, func, 0x04, new_word);
 }

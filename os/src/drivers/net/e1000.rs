@@ -300,7 +300,54 @@ impl E1000Device {
 
     // ---- Transmit ----
 
-    pub fn transmit(&mut self, data: &[u8]) {
+   pub fn transmit(&mut self, data: &[u8]) {
+    let idx = self.tx_tail;
+    let tdh_before = self.read_reg(E1000_TDH);
+    println!("[e1000 tx] idx={} len={} tdh_before={} first4=[{:02x} {:02x} {:02x} {:02x}]",
+             idx, data.len(), tdh_before, data[0], data[1], data[2], data[3]);
+
+    unsafe {
+        let desc = &mut *self.tx_ring.add(idx);
+
+        // Wait for descriptor to be available
+        let mut tries = 0u32;
+        while desc.status & DESC_STA_DD == 0 {
+            core::hint::spin_loop();
+            tries += 1;
+            if tries > 1_000_000 {
+                println!("[e1000] TX timeout idx={}", idx);
+                return;
+            }
+        }
+
+        // Copy data to DMA buffer
+        let buf = self.tx_bufs[idx] as *mut u8;
+        let len = data.len().min(BUF_SIZE);
+        ptr::copy_nonoverlapping(data.as_ptr(), buf, len);
+
+        // Fill descriptor
+        desc.length = len as u16;
+        desc.cmd = TDESC_CMD_EOP | TDESC_CMD_IFCS | TDESC_CMD_RS;
+        desc.status = 0;
+    }
+
+    self.tx_tail = (idx + 1) % NUM_TX_DESC;
+    self.write_reg(E1000_TDT, self.tx_tail as u32);
+
+    // 等一小段让硬件处理
+    for _ in 0..10000 { core::hint::spin_loop(); }
+    let tdh_after = self.read_reg(E1000_TDH);
+    let dd = unsafe { (&*self.tx_ring.add(idx)).status } & DESC_STA_DD;
+    println!("[e1000 tx] done idx={} tdh_after={} dd={}", idx, tdh_after, dd);
+}
+
+    // ---- Zero-copy transmit ----
+
+    /// Zero-copy transmit: program the next descriptor to DMA directly from
+    /// `pa` for `len` bytes, skipping the driver's tx_bufs memcpy. The caller
+    /// owns the memory at `pa` and must keep it valid until hardware has
+    /// consumed the descriptor (signalled by DD flipping back to 1).
+    pub fn transmit_pa(&mut self, pa: u64, len: u16) {
         let idx = self.tx_tail;
 
         unsafe {
@@ -312,18 +359,13 @@ impl E1000Device {
                 core::hint::spin_loop();
                 tries += 1;
                 if tries > 1_000_000 {
-                    println!("[e1000] TX timeout");
+                    println!("[e1000] TX timeout (pa)");
                     return;
                 }
             }
 
-            // Copy data to DMA buffer
-            let buf = self.tx_bufs[idx] as *mut u8;
-            let len = data.len().min(BUF_SIZE);
-            ptr::copy_nonoverlapping(data.as_ptr(), buf, len);
-
-            // Fill descriptor
-            desc.length = len as u16;
+            desc.buffer_addr = pa;
+            desc.length = len;
             desc.cmd = TDESC_CMD_EOP | TDESC_CMD_IFCS | TDESC_CMD_RS;
             desc.status = 0;
         }

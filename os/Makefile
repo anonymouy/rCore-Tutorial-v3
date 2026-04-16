@@ -12,12 +12,6 @@ BOARD := qemu
 SBI ?= rustsbi
 BOOTLOADER := ../bootloader/$(SBI)-$(BOARD).bin
 
-# GUI
-GUI ?= off
-ifeq ($(GUI), off)
-	GUI_OPTION := -display none
-endif
-
 # Building mode argument
 ifeq ($(MODE), release)
 	MODE_ARG := --release
@@ -63,6 +57,12 @@ kernel:
 clean:
 	@cargo clean
 
+alclean:
+	@cargo clean
+	cd ../user
+	make clean
+	cd ../os
+
 disasm: kernel
 	@$(OBJDUMP) $(DISASM) $(KERNEL_ELF) | less
 
@@ -76,13 +76,10 @@ run: run-inner
 QEMU_ARGS := -machine virt \
 			 -bios $(BOOTLOADER) \
 			 -serial stdio \
-			 $(GUI_OPTION) \
+			 -display none \
 			 -device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \
 			 -drive file=$(FS_IMG),if=none,format=raw,id=x0 \
 			 -device virtio-blk-device,drive=x0 \
-			 -device virtio-gpu-device \
-			 -device virtio-keyboard-device \
-			 -device virtio-mouse-device \
 			 -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 			 -netdev user,id=net0,hostfwd=udp::6200-:2000,hostfwd=tcp::6201-:80
 
