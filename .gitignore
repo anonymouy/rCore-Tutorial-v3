@@ -17,3 +17,6 @@ os/virt.out
 tools/
 pushall.sh
 .vscode/*.log
+*.tex
+*.drawio
+*.c
