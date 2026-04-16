@@ -83,7 +83,7 @@ QEMU_ARGS := -machine virt \
 			 -device virtio-gpu-device \
 			 -device virtio-keyboard-device \
 			 -device virtio-mouse-device \
-			 -device virtio-net-device,netdev=net0 \
+			 -device e1000,netdev=net0,mac=52:54:00:12:34:56 \
 			 -netdev user,id=net0,hostfwd=udp::6200-:2000,hostfwd=tcp::6201-:80
 
 fdt:

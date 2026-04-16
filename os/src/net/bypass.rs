@@ -223,9 +223,13 @@ pub fn bypass_rx() -> isize {
         let slot = bs.rx_slot(idx);
 
         loop {
-            // Blocking receive – fills buf with one raw Ethernet frame.
+            // Poll receive – spins until a frame arrives.
             let buf = core::slice::from_raw_parts_mut(slot.add(2), SLOT_SIZE - 2);
             let len = NET_DEVICE.receive(buf);
+            if len == 0 {
+                core::hint::spin_loop();
+                continue;
+            }
 
             // Transparently handle ARP requests for our IP.
             if len >= 14 {
