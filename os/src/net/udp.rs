@@ -36,6 +36,7 @@ impl File for UDP {
     }
 
 fn read(&self, mut buf: crate::mm::UserBuffer) -> usize {
+        const MAX_POLLS: u64 = 20_000_000;
         let mut loops = 0u64;
         loop {
             if let Some(data) = pop_data(self.socket_index) {
@@ -55,8 +56,9 @@ fn read(&self, mut buf: crate::mm::UserBuffer) -> usize {
                 return left;
             } else {
                 loops += 1;
-                if loops % 1_000_000 == 0 {
-                    println!("[udp::read] still waiting, loops={}", loops);
+                if loops >= MAX_POLLS {
+                    println!("[udp::read] timeout after {} polls", loops);
+                    return 0;
                 }
                 net_poll_handler();
             }
@@ -64,7 +66,6 @@ fn read(&self, mut buf: crate::mm::UserBuffer) -> usize {
     }
 
     fn write(&self, buf: crate::mm::UserBuffer) -> usize {
-        println!("[udp::write] called, buf_len={}", buf.len());
         let cfg = NET_CONFIG.exclusive_access();
 
         let mut data = vec![0u8; buf.len()];

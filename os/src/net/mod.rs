@@ -431,43 +431,25 @@ pub fn net_poll_handler() {
     if len == 0 {
         return;
     }
-    let et = if len >= 14 {
-        u16::from_be_bytes([recv_buf[12], recv_buf[13]])
-    } else {
-        0
-    };
-    println!("[net_poll] got {} bytes, ethertype=0x{:04x}", len, et);
 
     match parse_packet(&recv_buf[..len]) {
         ParsedPacket::Arp(arp) => {
-            println!("[net_poll] ARP op={} sender_mac={:02x?} sender_ip={:?} target_ip={:?}",
-                    arp.operation, arp.sender_mac.0, arp.sender_ip, arp.target_ip);
             if arp.operation == 1 {
                 let cfg = NET_CONFIG.exclusive_access();
                 if arp.target_ip == cfg.ip {
                     let reply = build_arp_reply(&cfg.mac, &cfg.ip, &arp.sender_mac, &arp.sender_ip);
-                    println!("[net_poll] reply len={} hex={:02x?}", reply.len(), &reply[..]);
                     NET_DEVICE.transmit(&reply);
-                    println!("[net_poll] ARP reply sent");
-                } else {
-                    println!("[net_poll] ARP target_ip mismatch, expected {:?}", cfg.ip);
                 }
             }
         }
 
         ParsedPacket::Udp(udp) => {
-            println!("[net_poll] UDP src={:?}:{} dst_port={} len={}",
-                     udp.source_ip, udp.source_port, udp.dest_port, udp.data.len());
             let target = udp.source_ip;
             let lport = udp.dest_port;
             let rport = udp.source_port;
 
             if let Some(socket_index) = get_socket(target, lport, rport) {
                 push_data(socket_index, udp.data);
-                println!("[net_poll] UDP pushed to socket idx={}", socket_index);
-            } else {
-                println!("[net_poll] UDP no match: searching (raddr={:?}, lport={}, rport={})",
-                         target, lport, rport);
             }
         }
 
@@ -504,9 +486,7 @@ pub fn net_poll_handler() {
             }
         }
 
-        ParsedPacket::Unknown => {
-            println!("[net_poll] unknown ethertype");
-        }
+        ParsedPacket::Unknown => {}
     }
 }
 

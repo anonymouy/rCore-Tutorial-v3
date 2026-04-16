@@ -40,6 +40,8 @@ const CTRL_ASDE: u32 = 1 << 5;
 
 // RCTL bits
 const RCTL_EN: u32 = 1 << 1;
+const RCTL_UPE: u32 = 1 << 3;        // ← 新增：Unicast Promiscuous Enable
+const RCTL_MPE: u32 = 1 << 4;        // ← 新增：Multicast Promiscuous Enable
 const RCTL_BAM: u32 = 1 << 15;
 const RCTL_BSIZE_2048: u32 = 0 << 16;
 const RCTL_SECRC: u32 = 1 << 26;
@@ -268,7 +270,8 @@ impl E1000Device {
 
         self.write_reg(
             E1000_RCTL,
-            RCTL_EN | RCTL_BAM | RCTL_BSIZE_2048 | RCTL_SECRC,
+            RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_BSIZE_2048 | RCTL_SECRC,
+            //       ^^^^^^^^^^^^^^^^^^^ 加这两个
         );
     }
 
@@ -300,46 +303,40 @@ impl E1000Device {
 
     // ---- Transmit ----
 
-   pub fn transmit(&mut self, data: &[u8]) {
-    let idx = self.tx_tail;
-    let tdh_before = self.read_reg(E1000_TDH);
-    println!("[e1000 tx] idx={} len={} tdh_before={} first4=[{:02x} {:02x} {:02x} {:02x}]",
-             idx, data.len(), tdh_before, data[0], data[1], data[2], data[3]);
+    pub fn transmit(&mut self, data: &[u8]) {
+        let idx = self.tx_tail;
 
-    unsafe {
-        let desc = &mut *self.tx_ring.add(idx);
+        unsafe {
+            let desc = self.tx_ring.add(idx);
 
-        // Wait for descriptor to be available
-        let mut tries = 0u32;
-        while desc.status & DESC_STA_DD == 0 {
-            core::hint::spin_loop();
-            tries += 1;
-            if tries > 1_000_000 {
-                println!("[e1000] TX timeout idx={}", idx);
-                return;
+            // Wait for descriptor to be available
+            let mut tries = 0u32;
+            while ptr::read_volatile(&(*desc).status) & DESC_STA_DD == 0 {
+                core::hint::spin_loop();
+                tries += 1;
+                if tries > 1_000_000 {
+                    println!("[e1000] TX timeout idx={}", idx);
+                    return;
+                }
             }
+
+            // Copy data to DMA buffer
+            let buf = self.tx_bufs[idx] as *mut u8;
+            let len = data.len().min(BUF_SIZE);
+            ptr::copy_nonoverlapping(data.as_ptr(), buf, len);
+
+            // Fill descriptor
+            ptr::write_volatile(&mut (*desc).length, len as u16);
+            ptr::write_volatile(
+                &mut (*desc).cmd,
+                TDESC_CMD_EOP | TDESC_CMD_IFCS | TDESC_CMD_RS,
+            );
+            ptr::write_volatile(&mut (*desc).status, 0);
         }
 
-        // Copy data to DMA buffer
-        let buf = self.tx_bufs[idx] as *mut u8;
-        let len = data.len().min(BUF_SIZE);
-        ptr::copy_nonoverlapping(data.as_ptr(), buf, len);
-
-        // Fill descriptor
-        desc.length = len as u16;
-        desc.cmd = TDESC_CMD_EOP | TDESC_CMD_IFCS | TDESC_CMD_RS;
-        desc.status = 0;
+        self.tx_tail = (idx + 1) % NUM_TX_DESC;
+        self.write_reg(E1000_TDT, self.tx_tail as u32);
     }
-
-    self.tx_tail = (idx + 1) % NUM_TX_DESC;
-    self.write_reg(E1000_TDT, self.tx_tail as u32);
-
-    // 等一小段让硬件处理
-    for _ in 0..10000 { core::hint::spin_loop(); }
-    let tdh_after = self.read_reg(E1000_TDH);
-    let dd = unsafe { (&*self.tx_ring.add(idx)).status } & DESC_STA_DD;
-    println!("[e1000 tx] done idx={} tdh_after={} dd={}", idx, tdh_after, dd);
-}
 
     // ---- Zero-copy transmit ----
 
@@ -351,11 +348,11 @@ impl E1000Device {
         let idx = self.tx_tail;
 
         unsafe {
-            let desc = &mut *self.tx_ring.add(idx);
+            let desc = self.tx_ring.add(idx);
 
             // Wait for descriptor to be available
             let mut tries = 0u32;
-            while desc.status & DESC_STA_DD == 0 {
+            while ptr::read_volatile(&(*desc).status) & DESC_STA_DD == 0 {
                 core::hint::spin_loop();
                 tries += 1;
                 if tries > 1_000_000 {
@@ -364,10 +361,13 @@ impl E1000Device {
                 }
             }
 
-            desc.buffer_addr = pa;
-            desc.length = len;
-            desc.cmd = TDESC_CMD_EOP | TDESC_CMD_IFCS | TDESC_CMD_RS;
-            desc.status = 0;
+            ptr::write_volatile(&mut (*desc).buffer_addr, pa);
+            ptr::write_volatile(&mut (*desc).length, len);
+            ptr::write_volatile(
+                &mut (*desc).cmd,
+                TDESC_CMD_EOP | TDESC_CMD_IFCS | TDESC_CMD_RS,
+            );
+            ptr::write_volatile(&mut (*desc).status, 0);
         }
 
         self.tx_tail = (idx + 1) % NUM_TX_DESC;
@@ -382,21 +382,25 @@ impl E1000Device {
         let idx = self.rx_tail;
 
         let len = unsafe {
-            let desc = &mut *self.rx_ring.add(idx);
+            let desc = self.rx_ring.add(idx);
+            let status = ptr::read_volatile(&(*desc).status);
 
-            if desc.status & DESC_STA_DD == 0 {
+            if status & DESC_STA_DD == 0 {
+                // MMIO read gives QEMU a chance to flush its net queue and
+                // deliver any packet SLIRP has waiting for the guest.
+                let _ = self.read_reg(E1000_ICR);
                 return 0;
             }
 
-            let pkt_len = desc.length as usize;
+            let pkt_len = ptr::read_volatile(&(*desc).length) as usize;
             let copy_len = pkt_len.min(buf.len());
 
             let src = self.rx_bufs[idx] as *const u8;
             ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), copy_len);
 
             // Return descriptor to hardware
-            desc.status = 0;
-            desc.length = 0;
+            ptr::write_volatile(&mut (*desc).status, 0);
+            ptr::write_volatile(&mut (*desc).length, 0);
 
             copy_len
         };
