@@ -102,8 +102,8 @@ fn build_udp_frame_into(
     let ip_total = 20 + udp_len;
     let frame_len = 14 + ip_total;
 
-    // Zero out header area
-    for b in buf[..42].iter_mut() { *b = 0; }
+    // Zero the header area (lowers to memset in release builds).
+    buf[..42].fill(0);
 
     buf[0..6].copy_from_slice(&[0xff; 6]);
     buf[6..12].copy_from_slice(src_mac);
@@ -122,9 +122,11 @@ fn build_udp_frame_into(
     buf[36..38].copy_from_slice(&dst_port.to_be_bytes());
     buf[38..40].copy_from_slice(&(udp_len as u16).to_be_bytes());
 
-    for j in 0..payload_size {
-        buf[42 + j] = (j & 0xff) as u8;
-    }
+    // Payload: single memset instead of a scalar byte loop. Content is
+    // irrelevant for the benchmark — only the IP/UDP length fields matter
+    // for the host echo server. 0xAB matches bench_e1000 / bench_udp_linux
+    // so wire-level traffic looks identical across benchmarks.
+    buf[42..42 + payload_size].fill(0xAB);
 
     frame_len
 }
@@ -230,23 +232,27 @@ unsafe fn bench_tx_throughput(
         count
     );
 
+    // Kick only when the ring is full (tx_slot_acquire returns None) or at
+    // the end. This amortises the syscall over a full ring of packets —
+    // the whole point of the bypass path. Previously we kicked at half
+    // ring, which turned bypass into "small-batch socket" and inflated
+    // per-packet ticks with unnecessary syscall overhead.
     let t0 = rdtime();
     let mut sent = 0usize;
     while sent < count {
-        if let Some((slot, tx_head)) = tx_slot_acquire(hdr, base, tx_off, slot_size, ring_size) {
-            let slot_buf = core::slice::from_raw_parts_mut(slot.add(2), slot_size - 2);
-            let frame_len = build_udp_frame_into(slot_buf, mac, ip, SRC_PORT, &DST_IP, DST_PORT, payload_size);
-            tx_slot_commit(hdr, slot, frame_len, tx_head);
-            sent += 1;
-            let cur_head = ptr::read_volatile(&(*hdr).tx_head);
-            let cur_tail = ptr::read_volatile(&(*hdr).tx_tail);
-            if cur_head.wrapping_sub(cur_tail) >= ring_size / 2 || sent == count {
-                net_bypass_tx();
+        let acquired = unsafe { tx_slot_acquire(hdr, base, tx_off, slot_size, ring_size) };
+        if let Some((slot, tx_head)) = acquired {
+            unsafe {
+                let slot_buf = core::slice::from_raw_parts_mut(slot.add(2), slot_size - 2);
+                let frame_len = build_udp_frame_into(slot_buf, mac, ip, SRC_PORT, &DST_IP, DST_PORT, payload_size);
+                tx_slot_commit(hdr, slot, frame_len, tx_head);
             }
+            sent += 1;
         } else {
             net_bypass_tx();
         }
     }
+    net_bypass_tx(); // final drain
     let t1 = rdtime();
 
     let elapsed = t1 - t0;

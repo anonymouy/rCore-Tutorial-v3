@@ -1,41 +1,23 @@
 #![no_std]
 #![no_main]
 
-//! e1000 NIC benchmark through the traditional kernel network stack.
+//! e1000 NIC benchmark through the rCore kernel socket path.
 //!
-//! All traffic goes via standard socket syscalls — no kernel-bypass.  The
-//! data path on TX is:
-//!
-//! ```text
-//!   user payload
-//!       │
-//!       │  sys_write (translated_byte_buffer: kernel sees user pages)
-//!       ▼
-//!   kernel Vec<u8>                        <-- copy #1 (user -> kernel)
-//!       │
-//!       │  UDP::write -> build_udp_packet
-//!       ▼
-//!   kernel frame Vec<u8>
-//!       │
-//!       │  NET_DEVICE.transmit
-//!       ▼
-//!   e1000 tx_bufs[idx]                    <-- copy #2 (kernel -> DMA buf)
-//!       │
-//!       │  DMA
-//!       ▼
-//!       NIC
-//! ```
-//!
-//! For the zero-copy counterpart, see `bench_bypass.rs`.
+//! Mirrors `bench_udp_linux.c` one-for-one so numbers are directly
+//! comparable: same payload sizes (64 / 512 / 1024), same iteration
+//! counts (TX=1000, RTT=200+20 warmup, Burst=16), same measurement
+//! points (no sync barriers), and the same output format.
 //!
 //! Host-side echo server (required for RTT tests):
 //!
 //! ```text
 //!   python3 -c "
-//!   import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-//!   s.bind(('0.0.0.0',26099))
+//!   import socket
+//!   s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+//!   s.bind(('0.0.0.0', 26099))
 //!   while True:
-//!       d,a=s.recvfrom(4096); s.sendto(d,a)
+//!       d, a = s.recvfrom(4096)
+//!       s.sendto(d, a)
 //!   "
 //! ```
 
@@ -46,23 +28,26 @@ extern crate user_lib;
 use user_lib::{close, connect, read, write};
 
 // =====================================================================
-// Configuration
+// Configuration (must match bench_udp_linux.c)
 // =====================================================================
 
-const TX_COUNT: usize = 1000;
-const RTT_COUNT: usize = 200;
-const WARMUP: usize = 20;
+const THROUGHPUT_COUNT: usize = 1000;
+const LATENCY_COUNT: usize = 200;
+const WARMUP_COUNT: usize = 20;
+const MAX_LATENCY_SAMPLES: usize = 200;
+const BURST_SIZE: usize = 16;
 const PAYLOAD_SIZES: [usize; 3] = [64, 512, 1024];
 const DST_IP: u32 = (10 << 24) | (0 << 16) | (2 << 8) | 2; // 10.0.2.2
 const DST_PORT: u16 = 26099;
-const SRC_PORT: u16 = 2002;
+const SRC_PORT: u16 = 2001;
 
 // =====================================================================
 // Timing: RISC-V rdtime (QEMU virt timebase = 10 MHz -> 1 tick = 100 ns)
+// Same CSR that bench_udp_linux.c uses.
 // =====================================================================
 
 #[inline(always)]
-fn rdtime() -> u64 {
+fn rdtime_ticks() -> u64 {
     let v: u64;
     unsafe { core::arch::asm!("rdtime {}", out(reg) v) }
     v
@@ -84,138 +69,182 @@ fn sort_u64(a: &mut [u64]) {
     }
 }
 
-fn print_stats(label: &str, s: &mut [u64]) {
-    if s.is_empty() {
-        println!("  {}: no samples", label);
+fn print_stats(label: &str, samples: &mut [u64], unit: &str) {
+    if samples.is_empty() {
+        println!("  {} : no samples", label);
         return;
     }
-    sort_u64(s);
-    let n = s.len();
-    let sum: u64 = s.iter().copied().sum();
+    sort_u64(samples);
+    let n = samples.len();
+    let sum: u64 = samples.iter().copied().sum();
+
+    let min = samples[0];
+    let max = samples[n - 1];
     let avg = sum / n as u64;
+    let p50 = samples[n / 2];
+    let p99 = samples[(n * 99) / 100];
+
     println!("  {} (n={}):", label, n);
     println!(
-        "    min={} avg={} p50={} p99={} max={} [ticks]",
-        s[0],
-        avg,
-        s[n / 2],
-        s[(n * 99) / 100],
-        s[n - 1],
-    );
-    println!(
-        "    (~{} / {} / {} / {} / {} ns)",
-        s[0] * 100,
-        avg * 100,
-        s[n / 2] * 100,
-        s[(n * 99) / 100] * 100,
-        s[n - 1] * 100,
+        "    min={} avg={} max={} p50={} p99={} [{}]",
+        min, avg, max, p50, p99, unit
     );
 }
 
 // =====================================================================
-// Benchmark: Socket RTT latency
+// Socket helpers
 //
-// Pattern: write one packet, read the echo reply, measure (t1 - t0).
-// Every iteration crosses user/kernel boundary twice (write, read),
-// each crossing incurring at least one memcpy.
+// Linux uses bind() + SO_RCVTIMEO. rCore's UDP is connect-style (raddr
+// baked in) and the blocking timeout is enforced inside udp::read's
+// MAX_POLLS limit. Functionally equivalent from the benchmark's point
+// of view: each test gets a fresh socket on SRC_PORT, and read() will
+// return 0 on timeout rather than hang forever.
 // =====================================================================
 
-fn bench_socket_rtt(fd: usize, payload: &[u8]) {
+fn create_udp_socket() -> isize {
+    connect(DST_IP, SRC_PORT, DST_PORT)
+}
+
+// =====================================================================
+// Test 1: TX-only throughput
+//
+// Measures the cost of write() calls (kernel enqueue path).
+// Note: write() returns as soon as the TDT MMIO write is complete;
+// the packet may not yet be on the host. Matches Linux sendto() which
+// returns once the skb is handed off to the device queue.
+// =====================================================================
+
+fn bench_socket_tx_throughput(payload_size: usize) {
     println!(
-        "\n  [socket-rtt] payload={} warmup={} count={}",
-        payload.len(),
-        WARMUP,
-        RTT_COUNT
+        "\n--- [Socket] TX Throughput (payload={} count={}) ---",
+        payload_size, THROUGHPUT_COUNT
     );
 
-    let mut samples = [0u64; 200];
+    let fd = create_udp_socket();
+    if fd < 0 {
+        println!("  [FAIL] connect: {}", fd);
+        return;
+    }
+    let fd = fd as usize;
+
+    let payload = [0xABu8; 1024];
+    let payload = &payload[..payload_size];
+
+    let t0 = rdtime_ticks();
+    for _ in 0..THROUGHPUT_COUNT {
+        write(fd, payload);
+    }
+    let t1 = rdtime_ticks();
+
+    let elapsed = t1 - t0;
+    let ticks_per_pkt = elapsed / THROUGHPUT_COUNT as u64;
+
+    println!(
+        "  total_ticks={} packets={} ticks_per_pkt={}",
+        elapsed, THROUGHPUT_COUNT, ticks_per_pkt
+    );
+    println!(
+        "  (QEMU 10MHz: 1 tick = 100ns, so per_pkt ~ {} ns)",
+        ticks_per_pkt * 100
+    );
+
+    close(fd);
+}
+
+// =====================================================================
+// Test 2: RTT latency (send one, receive one)
+// =====================================================================
+
+fn bench_socket_rtt_latency(payload_size: usize) {
+    println!(
+        "\n--- [Socket] RTT Latency (payload={} warmup={} count={}) ---",
+        payload_size, WARMUP_COUNT, LATENCY_COUNT
+    );
+
+    let fd = create_udp_socket();
+    if fd < 0 {
+        println!("  [FAIL] connect: {}", fd);
+        return;
+    }
+    let fd = fd as usize;
+
+    let sendbuf = [0xABu8; 1024];
+    let sendbuf = &sendbuf[..payload_size];
     let mut recvbuf = [0u8; 2048];
-    let total = WARMUP + RTT_COUNT;
-    let mut lost = 0usize;
+
+    let mut samples = [0u64; MAX_LATENCY_SAMPLES];
+    let total = WARMUP_COUNT + LATENCY_COUNT;
+    let mut collected: usize = 0;
+    let mut lost: usize = 0;
 
     for i in 0..total {
-        let t0 = rdtime();
-        write(fd, payload);
+        let t0 = rdtime_ticks();
+
+        write(fd, sendbuf);
         let rc = read(fd, &mut recvbuf);
-        let t1 = rdtime();
+
+        let t1 = rdtime_ticks();
 
         if rc > 0 {
-            if i >= WARMUP && (i - WARMUP) < 200 {
-                samples[i - WARMUP] = t1 - t0;
+            if i >= WARMUP_COUNT && collected < MAX_LATENCY_SAMPLES {
+                samples[collected] = t1 - t0;
+                collected += 1;
             }
         } else {
             lost += 1;
         }
 
         if (i + 1) % 50 == 0 {
-            println!("    ... {}/{}", i + 1, total);
+            println!("  ... {}/{}", i + 1, total);
         }
     }
 
-    print_stats("socket_rtt", &mut samples[..RTT_COUNT.min(200)]);
-    if lost > 0 {
-        println!("    lost_or_timeout={}/{}", lost, total);
-    }
+    print_stats("rtt_ticks", &mut samples[..collected], "ticks");
+    println!("  lost_or_timeout={}/{}", lost, total);
+    close(fd);
 }
 
 // =====================================================================
-// Benchmark: Socket TX throughput
+// Test 3: Burst TX — send a burst of packets, measure total time
 //
-// Sends TX_COUNT packets in a tight loop with no RX. Measures only the
-// sys_write path (user -> kernel copy -> build frame -> e1000 DMA).
-// Reply packets accumulate in the kernel socket queue; we don't drain
-// them (they get dropped on close).
+// Each write() is an implicit enqueue+flush at the driver level (TDT
+// MMIO write). No RX involved. Matches bench_udp_linux.c exactly.
 // =====================================================================
 
-fn bench_socket_tx(fd: usize, payload: &[u8]) {
+fn bench_socket_burst(payload_size: usize) {
     println!(
-        "\n  [socket-tx] payload={} count={}",
-        payload.len(),
-        TX_COUNT
+        "\n--- [Socket] Burst TX (payload={} burst={}) ---",
+        payload_size, BURST_SIZE
     );
 
-    let t0 = rdtime();
-    for _ in 0..TX_COUNT {
+    let fd = create_udp_socket();
+    if fd < 0 {
+        println!("  [FAIL] connect: {}", fd);
+        return;
+    }
+    let fd = fd as usize;
+
+    let payload = [0xABu8; 1024];
+    let payload = &payload[..payload_size];
+
+    let t0 = rdtime_ticks();
+    for _ in 0..BURST_SIZE {
         write(fd, payload);
     }
-    let t1 = rdtime();
+    let t1 = rdtime_ticks();
 
     let elapsed = t1 - t0;
-    let per_pkt = elapsed / TX_COUNT as u64;
+    let per_pkt = if BURST_SIZE > 0 {
+        elapsed / BURST_SIZE as u64
+    } else {
+        0
+    };
     println!(
-        "    {} pkts in {} ticks, {} ticks/pkt (~{} ns/pkt)",
-        TX_COUNT,
-        elapsed,
-        per_pkt,
-        per_pkt * 100
+        "  burst: {} packets in {} ticks ({} ticks/pkt)",
+        BURST_SIZE, elapsed, per_pkt
     );
-}
 
-// =====================================================================
-// Benchmark: Burst TX
-//
-// Like socket-tx but only 16 packets back-to-back, to expose per-packet
-// overhead without the loop amortising it.
-// =====================================================================
-
-fn bench_socket_burst(fd: usize, payload: &[u8]) {
-    const BURST: usize = 16;
-    println!("\n  [socket-burst] payload={} burst={}", payload.len(), BURST);
-
-    let t0 = rdtime();
-    for _ in 0..BURST {
-        write(fd, payload);
-    }
-    let t1 = rdtime();
-
-    let elapsed = t1 - t0;
-    println!(
-        "    {} pkts in {} ticks ({} ticks/pkt, ~{} ns/pkt)",
-        BURST,
-        elapsed,
-        elapsed / BURST as u64,
-        (elapsed / BURST as u64) * 100
-    );
+    close(fd);
 }
 
 // =====================================================================
@@ -224,81 +253,45 @@ fn bench_socket_burst(fd: usize, payload: &[u8]) {
 
 #[unsafe(no_mangle)]
 pub fn main() -> i32 {
-    println!("===============================================");
-    println!(" rCore e1000 Benchmark — Kernel Socket Path");
-    println!("===============================================");
+    println!("=============================================");
+    println!(" rCore e1000 Socket UDP Benchmark (rdtime ticks)");
+    println!("=============================================");
     println!("Timing: RISC-V rdtime (QEMU 10MHz = 100ns/tick)");
-    println!("Driver: Intel e1000 (PCI MMIO)");
-    println!("Path:   user -> syscall -> kernel stack -> e1000 DMA");
-    println!("        (>= 2 memcpy on TX, >= 2 memcpy on RX)");
 
-    // ---- Calibration ----
-    let c0 = rdtime();
+    // Calibration
+    let c0 = rdtime_ticks();
     let mut dummy: u64 = 0;
     for i in 0..100_000u64 {
         dummy = dummy.wrapping_add(i);
     }
-    let c1 = rdtime();
+    let c1 = rdtime_ticks();
     println!(
-        "Calibration: {} ticks / 100K iter (dummy={})\n",
+        "Calibration: {} ticks for 100K loop (dummy={})\n",
         c1 - c0,
         dummy
     );
 
-    // ---- Open UDP socket ----
-    let fd = connect(DST_IP, SRC_PORT, DST_PORT);
-    if fd < 0 {
-        println!("[FAIL] connect: {}", fd);
-        return -1;
-    }
-    let fd = fd as usize;
-    println!(
-        "Socket: fd={} -> {}.{}.{}.{}:{} (sport={})",
-        fd,
-        (DST_IP >> 24) & 0xff,
-        (DST_IP >> 16) & 0xff,
-        (DST_IP >> 8) & 0xff,
-        DST_IP & 0xff,
-        DST_PORT,
-        SRC_PORT,
-    );
-
-    let payload_buf = [0xABu8; 1024];
-
-    // ==================================================================
-    // Phase 1: RTT latency
-    //
-    // Run first, before TX throughput, so there are no stale echo
-    // replies queued in the kernel socket from a previous phase.
-    // ==================================================================
-    println!("\n============ Phase 1: RTT Latency ============");
+    // RTT first: avoid consuming stale reply packets generated by
+    // TX throughput (same rationale as bench_udp_linux.c).
     for &sz in &PAYLOAD_SIZES {
-        println!("\n------ Payload {} bytes ------", sz);
-        bench_socket_rtt(fd, &payload_buf[..sz]);
+        println!("\n========== RTT: Payload Size: {} bytes ==========", sz);
+        bench_socket_rtt_latency(sz);
     }
 
-    // ==================================================================
-    // Phase 2: TX throughput
-    // ==================================================================
-    println!("\n============ Phase 2: TX Throughput ============");
+    // TX throughput: generates reply packets that are never consumed.
     for &sz in &PAYLOAD_SIZES {
-        println!("\n------ Payload {} bytes ------", sz);
-        bench_socket_tx(fd, &payload_buf[..sz]);
+        println!("\n========== TX: Payload Size: {} bytes ==========", sz);
+        bench_socket_tx_throughput(sz);
     }
 
-    // ==================================================================
-    // Phase 3: Burst TX (isolate per-packet overhead)
-    // ==================================================================
-    println!("\n============ Phase 3: Burst TX ============");
+    // Burst TX: no RX involved.
     for &sz in &PAYLOAD_SIZES {
-        println!("\n------ Payload {} bytes ------", sz);
-        bench_socket_burst(fd, &payload_buf[..sz]);
+        println!("\n========== Burst: Payload Size: {} bytes ==========", sz);
+        bench_socket_burst(sz);
     }
 
-    close(fd);
-
-    println!("\n===============================================");
-    println!(" Benchmark complete.");
-    println!("===============================================");
+    println!("\n=============================================");
+    println!(" All benchmarks complete.");
+    println!("=============================================");
     0
 }
