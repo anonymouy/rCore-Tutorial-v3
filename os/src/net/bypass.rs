@@ -4,8 +4,8 @@
 //!
 //! ```text
 //! Page  0       : NetBypassHeader  (control + config)
-//! Pages 1  .. 8 : TX ring – 16 slots x 2048 B
-//! Pages 9  ..16 : RX ring – 16 slots x 2048 B
+//! Pages 1  ..32 : TX ring – 64 slots x 2048 B
+//! Pages 33 ..64 : RX ring – 64 slots x 2048 B
 //! ```
 //!
 //! Each slot: `[u16-LE packet_len][u8; packet_data ...]`
@@ -17,6 +17,7 @@
 
 use alloc::vec::Vec;
 use core::ptr;
+use core::sync::atomic::{fence, Ordering};
 use lazy_static::lazy_static;
 
 use crate::config::PAGE_SIZE;
@@ -25,19 +26,19 @@ use crate::mm::{
     frame_alloc, FrameTracker, MapPermission, VirtAddr, VirtPageNum,
 };
 use crate::sync::UPIntrFreeCell;
-use crate::task::current_process;
+use crate::task::{current_process, pid2process};
 
 use super::{build_arp_reply, IPv4, MacAddress, NET_CONFIG};
 
 /// Fixed virtual address where the shared buffer is mapped in user space.
 const BYPASS_VADDR: usize = 0x20000000;
 
-const RING_SIZE: usize = 16;
+const RING_SIZE: usize = 64;
 const SLOT_SIZE: usize = 2048;
 const TX_OFFSET: usize = PAGE_SIZE; // right after the header page
 const RX_OFFSET: usize = TX_OFFSET + RING_SIZE * SLOT_SIZE;
-const TOTAL_SIZE: usize = RX_OFFSET + RING_SIZE * SLOT_SIZE; // 69632
-const NUM_PAGES: usize = (TOTAL_SIZE + PAGE_SIZE - 1) / PAGE_SIZE; // 17
+const TOTAL_SIZE: usize = RX_OFFSET + RING_SIZE * SLOT_SIZE; // 266240
+const NUM_PAGES: usize = (TOTAL_SIZE + PAGE_SIZE - 1) / PAGE_SIZE; // 65
 
 /// Shared header at offset 0 of the mapped region.
 #[repr(C)]
@@ -69,6 +70,7 @@ pub struct NetBypassHeader {
 
 struct BypassState {
     frames: Vec<FrameTracker>,
+    owner_pid: usize,
 }
 
 impl BypassState {
@@ -107,6 +109,8 @@ lazy_static! {
 /// Allocate the shared buffer (once), map it into the calling process and
 /// return the user-space virtual address.
 pub fn bypass_setup() -> isize {
+    let process = current_process();
+    let current_pid = process.getpid();
     let mut state = BYPASS_STATE.exclusive_access();
 
     // Allocate physical frames on first call.
@@ -138,10 +142,46 @@ pub fn bypass_setup() -> isize {
             );
         }
         drop(cfg);
-        *state = Some(BypassState { frames });
+        *state = Some(BypassState {
+            frames,
+            owner_pid: current_pid,
+        });
+    } else {
+        let bs = state.as_mut().unwrap();
+        if bs.owner_pid != current_pid {
+            // Do not let another live process reset the active bypass
+            // mapping. Once the old owner exits, pid2process() no longer
+            // finds it and a new benchmark run may take ownership.
+            if pid2process(bs.owner_pid).is_some() {
+                return -1;
+            }
+            bs.owner_pid = current_pid;
+        }
     }
 
     let bs = state.as_ref().unwrap();
+
+    // Map each physical page into the current process at BYPASS_VADDR + i*PAGE_SIZE.
+    // If the same process calls setup twice, the page is already mapped
+    // and `page_table.map()` would assert. Skip pages that are already
+    // mapped to the expected PPN; refuse to silently rewire a different one.
+    let mut inner = process.inner_exclusive_access();
+    for (i, ft) in bs.frames.iter().enumerate() {
+        let vpn = VirtPageNum::from(VirtAddr::from(BYPASS_VADDR + i * PAGE_SIZE));
+        match inner.memory_set.translate(vpn) {
+            Some(pte) if pte.is_valid() => {
+                if pte.ppn() != ft.ppn {
+                    return -1;
+                }
+            }
+            _ => inner.memory_set.map_page_direct(
+                vpn,
+                ft.ppn,
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            ),
+        }
+    }
+    drop(inner);
 
     // Reset software ring pointers so a fresh run doesn't inherit stale
     // state from a prior process. We cannot safely drain the NIC RX queue
@@ -158,28 +198,6 @@ pub fn bypass_setup() -> isize {
         ptr::write_volatile(&mut (*hdr).tx_tail, 0);
         ptr::write_volatile(&mut (*hdr).rx_head, 0);
         ptr::write_volatile(&mut (*hdr).rx_tail, 0);
-    }
-
-    // Map each physical page into the current process at BYPASS_VADDR + i*PAGE_SIZE.
-    // If the same process calls setup twice, the page is already mapped
-    // and `page_table.map()` would assert. Skip pages that are already
-    // mapped to the expected PPN; refuse to silently rewire a different one.
-    let process = current_process();
-    let mut inner = process.inner_exclusive_access();
-    for (i, ft) in bs.frames.iter().enumerate() {
-        let vpn = VirtPageNum::from(VirtAddr::from(BYPASS_VADDR + i * PAGE_SIZE));
-        match inner.memory_set.translate(vpn) {
-            Some(pte) if pte.is_valid() => {
-                if pte.ppn() != ft.ppn {
-                    return -1;
-                }
-            }
-            _ => inner.memory_set.map_page_direct(
-                vpn,
-                ft.ppn,
-                MapPermission::R | MapPermission::W | MapPermission::U,
-            ),
-        }
     }
 
     BYPASS_VADDR as isize
@@ -237,6 +255,11 @@ pub fn bypass_tx() -> isize {
     unsafe {
         let tx_head = ptr::read_volatile(&(*hdr).tx_head);
         let mut tx_tail = ptr::read_volatile(&(*hdr).tx_tail);
+        let pending = tx_head.wrapping_sub(tx_tail);
+        if pending > RING_SIZE as u32 {
+            return -2;
+        }
+        fence(Ordering::Acquire);
 
         while tx_tail != tx_head {
             let idx = (tx_tail % RING_SIZE as u32) as usize;
@@ -250,6 +273,7 @@ pub fn bypass_tx() -> isize {
             tx_tail = tx_tail.wrapping_add(1);
             sent += 1;
         }
+        fence(Ordering::Release);
         ptr::write_volatile(&mut (*hdr).tx_tail, tx_tail);
     }
     sent as isize
@@ -314,6 +338,7 @@ pub fn bypass_rx() -> isize {
             let len_bytes = (len as u16).to_le_bytes();
             ptr::write(slot, len_bytes[0]);
             ptr::write(slot.add(1), len_bytes[1]);
+            fence(Ordering::Release);
             ptr::write_volatile(&mut (*hdr).rx_head, rx_head.wrapping_add(1));
             return len as isize;
         }
