@@ -143,19 +143,82 @@ pub fn bypass_setup() -> isize {
 
     let bs = state.as_ref().unwrap();
 
+    // Reset software ring pointers so a fresh run doesn't inherit stale
+    // state from a prior process. We cannot safely drain the NIC RX queue
+    // here because NET_DEVICE.receive() is blocking on virtio-net (no
+    // "queue empty" return path); calling it on an empty ring would hang.
+    //
+    // Packets stranded in the NIC RX ring from an earlier run's TX-phase
+    // therefore remain visible to the new run — see `bench_bypass.rs`
+    // which uses a generous WARMUP to absorb them before the measurement
+    // window starts.
+    unsafe {
+        let hdr = bs.header();
+        ptr::write_volatile(&mut (*hdr).tx_head, 0);
+        ptr::write_volatile(&mut (*hdr).tx_tail, 0);
+        ptr::write_volatile(&mut (*hdr).rx_head, 0);
+        ptr::write_volatile(&mut (*hdr).rx_tail, 0);
+    }
+
     // Map each physical page into the current process at BYPASS_VADDR + i*PAGE_SIZE.
+    // If the same process calls setup twice, the page is already mapped
+    // and `page_table.map()` would assert. Skip pages that are already
+    // mapped to the expected PPN; refuse to silently rewire a different one.
     let process = current_process();
     let mut inner = process.inner_exclusive_access();
     for (i, ft) in bs.frames.iter().enumerate() {
         let vpn = VirtPageNum::from(VirtAddr::from(BYPASS_VADDR + i * PAGE_SIZE));
-        inner.memory_set.map_page_direct(
-            vpn,
-            ft.ppn,
-            MapPermission::R | MapPermission::W | MapPermission::U,
-        );
+        match inner.memory_set.translate(vpn) {
+            Some(pte) if pte.is_valid() => {
+                if pte.ppn() != ft.ppn {
+                    return -1;
+                }
+            }
+            _ => inner.memory_set.map_page_direct(
+                vpn,
+                ft.ppn,
+                MapPermission::R | MapPermission::W | MapPermission::U,
+            ),
+        }
     }
 
     BYPASS_VADDR as isize
+}
+
+// ---------------------------------------------------------------------------
+// Pointer snapshot
+// ---------------------------------------------------------------------------
+
+/// Snapshot of the kernel-virtual pointers needed to operate on the rings
+/// without holding `BYPASS_STATE`.
+///
+/// Frames inside `BypassState` are pinned (they're owned by the static
+/// `BYPASS_STATE` and never freed during kernel lifetime), so the raw
+/// pointers below remain valid after the guard is dropped. Snapshotting
+/// here lets device I/O — which can spin or relock — run *outside* the
+/// `UPIntrFreeCell` critical section, which would otherwise keep
+/// interrupts disabled across blocking receives.
+struct RingPtrs {
+    hdr: *mut NetBypassHeader,
+    tx: [*mut u8; RING_SIZE],
+    rx: [*mut u8; RING_SIZE],
+}
+
+fn snapshot_ptrs() -> Option<RingPtrs> {
+    let state = BYPASS_STATE.exclusive_access();
+    let bs = state.as_ref()?;
+    let mut tx = [core::ptr::null_mut(); RING_SIZE];
+    let mut rx = [core::ptr::null_mut(); RING_SIZE];
+    for i in 0..RING_SIZE {
+        tx[i] = bs.tx_slot(i);
+        rx[i] = bs.rx_slot(i);
+    }
+    Some(RingPtrs {
+        hdr: bs.header(),
+        tx,
+        rx,
+    })
+    // guard dropped here
 }
 
 // ---------------------------------------------------------------------------
@@ -164,12 +227,11 @@ pub fn bypass_setup() -> isize {
 
 /// Send every pending packet in the TX ring via NET_DEVICE.
 pub fn bypass_tx() -> isize {
-    let state = BYPASS_STATE.exclusive_access();
-    let bs = match state.as_ref() {
-        Some(s) => s,
+    let ptrs = match snapshot_ptrs() {
+        Some(p) => p,
         None => return -1,
     };
-    let hdr = bs.header();
+    let hdr = ptrs.hdr;
     let mut sent: u32 = 0;
 
     unsafe {
@@ -178,7 +240,7 @@ pub fn bypass_tx() -> isize {
 
         while tx_tail != tx_head {
             let idx = (tx_tail % RING_SIZE as u32) as usize;
-            let slot = bs.tx_slot(idx);
+            let slot = ptrs.tx[idx];
             let pkt_len =
                 u16::from_le_bytes([ptr::read(slot), ptr::read(slot.add(1))]) as usize;
             if pkt_len > 0 && pkt_len <= SLOT_SIZE - 2 {
@@ -203,12 +265,11 @@ pub fn bypass_tx() -> isize {
 /// blocks until a non-ARP frame arrives.  Returns the frame length on
 /// success, or a negative error code.
 pub fn bypass_rx() -> isize {
-    let state = BYPASS_STATE.exclusive_access();
-    let bs = match state.as_ref() {
-        Some(s) => s,
+    let ptrs = match snapshot_ptrs() {
+        Some(p) => p,
         None => return -1,
     };
-    let hdr = bs.header();
+    let hdr = ptrs.hdr;
 
     unsafe {
         let rx_head = ptr::read_volatile(&(*hdr).rx_head);
@@ -220,7 +281,7 @@ pub fn bypass_rx() -> isize {
         }
 
         let idx = (rx_head % RING_SIZE as u32) as usize;
-        let slot = bs.rx_slot(idx);
+        let slot = ptrs.rx[idx];
 
         loop {
             // Blocking receive – fills buf with one raw Ethernet frame.
