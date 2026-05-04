@@ -2,6 +2,7 @@
 !.github/*
 !.vscode/settings.json
 !.devcontainer/devcontainer.json
+!README.md
 
 .idea/*
 **/target/
@@ -20,3 +21,12 @@ pushall.sh
 *.tex
 *.drawio
 *.c
+*.md
+
+# Local benchmark / bypass binaries — not pushed upstream
+/user/src/bin/bench_*.rs
+/user/src/bin/bypass_*.rs
+
+# Keep README and the upstream dev-env note; ignore other *.md
+!README.md
+!dev-env-info.md
