@@ -15,6 +15,7 @@ os/src/linker.ld
 os/last-*
 os/.gdb_history
 os/virt.out
+patches/
 tools/
 pushall.sh
 .vscode/*.log
