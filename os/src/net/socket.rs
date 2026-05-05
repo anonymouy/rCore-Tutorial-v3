@@ -5,12 +5,15 @@ use lazy_static::lazy_static;
 use super::IPv4;
 use crate::sync::UPIntrFreeCell;
 
+const SOCKET_RECV_QUEUE_LIMIT: usize = 128;
+
 // TODO: specify the protocol, TCP or UDP
 pub struct Socket {
     pub raddr: IPv4,                // remote address
     pub lport: u16,                 // local port
     pub rport: u16,                 // remote port
     pub buffers: VecDeque<Vec<u8>>, // datas
+    pub dropped: usize,
     pub seq: u32,
     pub ack: u32,
 }
@@ -79,6 +82,7 @@ pub fn add_socket(raddr: IPv4, lport: u16, rport: u16) -> Option<usize> {
         lport,
         rport,
         buffers: VecDeque::new(),
+        dropped: 0,
         seq: 0,
         ack: 0,
     };
@@ -106,11 +110,12 @@ pub fn push_data(index: usize, data: Vec<u8>) {
     assert!(socket_table.len() > index);
     assert!(socket_table[index].is_some());
 
-    socket_table[index]
-        .as_mut()
-        .unwrap()
-        .buffers
-        .push_back(data);
+    let socket = socket_table[index].as_mut().unwrap();
+    if socket.buffers.len() < SOCKET_RECV_QUEUE_LIMIT {
+        socket.buffers.push_back(data);
+    } else {
+        socket.dropped += 1;
+    }
 }
 
 pub fn pop_data(index: usize) -> Option<Vec<u8>> {

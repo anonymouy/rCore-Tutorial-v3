@@ -1,7 +1,7 @@
 //! Intel e1000 (82540EM) NIC driver for QEMU RISC-V.
 //!
 //! Implements a bare-metal driver using MMIO register access and legacy
-//! transmit/receive descriptor rings.  Polling-based (no interrupts).
+//! transmit/receive descriptor rings.
 
 use core::ptr;
 
@@ -16,6 +16,7 @@ use crate::mm::{FrameTracker, PhysAddr, frame_alloc};
 const E1000_CTRL: usize = 0x0000;
 const E1000_STATUS: usize = 0x0008;
 const E1000_ICR: usize = 0x00C0;
+const E1000_IMS: usize = 0x00D0;
 const E1000_IMC: usize = 0x00D8;
 const E1000_RCTL: usize = 0x0100;
 const E1000_TCTL: usize = 0x0400;
@@ -40,8 +41,6 @@ const CTRL_ASDE: u32 = 1 << 5;
 
 // RCTL bits
 const RCTL_EN: u32 = 1 << 1;
-const RCTL_UPE: u32 = 1 << 3;        // ← 新增：Unicast Promiscuous Enable
-const RCTL_MPE: u32 = 1 << 4;        // ← 新增：Multicast Promiscuous Enable
 const RCTL_BAM: u32 = 1 << 15;
 const RCTL_BSIZE_2048: u32 = 0 << 16;
 const RCTL_SECRC: u32 = 1 << 26;
@@ -59,6 +58,11 @@ const TDESC_CMD_RS: u8 = 1 << 3;
 
 // Descriptor STATUS bits
 const DESC_STA_DD: u8 = 1 << 0;
+
+const IMS_LSC: u32 = 1 << 2;
+const IMS_RXDMT0: u32 = 1 << 4;
+const IMS_RXO: u32 = 1 << 6;
+const IMS_RXT0: u32 = 1 << 7;
 
 const NUM_RX_DESC: usize = 32;
 const NUM_TX_DESC: usize = 32;
@@ -212,7 +216,7 @@ impl E1000Device {
         // 2. Link up
         self.write_reg(E1000_CTRL, CTRL_SLU | CTRL_ASDE);
 
-        // 3. Disable interrupts
+        // 3. Mask interrupts while descriptor rings are being set up.
         self.write_reg(E1000_IMC, 0xFFFF_FFFF);
         let _ = self.read_reg(E1000_ICR);
 
@@ -233,8 +237,7 @@ impl E1000Device {
 
         println!(
             "[e1000] MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            self.mac[0], self.mac[1], self.mac[2],
-            self.mac[3], self.mac[4], self.mac[5],
+            self.mac[0], self.mac[1], self.mac[2], self.mac[3], self.mac[4], self.mac[5],
         );
 
         // 6. Init RX
@@ -242,6 +245,9 @@ impl E1000Device {
 
         // 7. Init TX
         self.init_tx(tx_ring_pa);
+
+        // 8. Enable RX-related interrupts after rings are ready.
+        self.enable_interrupts();
 
         println!(
             "[e1000] initialized, status={:#x}",
@@ -270,8 +276,7 @@ impl E1000Device {
 
         self.write_reg(
             E1000_RCTL,
-            RCTL_EN | RCTL_UPE | RCTL_MPE | RCTL_BAM | RCTL_BSIZE_2048 | RCTL_SECRC,
-            //       ^^^^^^^^^^^^^^^^^^^ 加这两个
+            RCTL_EN | RCTL_BAM | RCTL_BSIZE_2048 | RCTL_SECRC,
         );
     }
 
@@ -299,6 +304,15 @@ impl E1000Device {
             E1000_TCTL,
             TCTL_EN | TCTL_PSP | (0x10 << TCTL_CT_SHIFT) | (0x40 << TCTL_COLD_SHIFT),
         );
+    }
+
+    fn enable_interrupts(&mut self) {
+        let _ = self.read_reg(E1000_ICR);
+        self.write_reg(E1000_IMS, IMS_LSC | IMS_RXDMT0 | IMS_RXO | IMS_RXT0);
+    }
+
+    pub fn ack_interrupts(&mut self) -> u32 {
+        self.read_reg(E1000_ICR)
     }
 
     // ---- Transmit ----

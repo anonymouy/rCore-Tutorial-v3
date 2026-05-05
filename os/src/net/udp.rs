@@ -1,10 +1,15 @@
 use crate::drivers::NET_DEVICE;
 use crate::fs::File;
+use crate::task::suspend_current_and_run_next;
+use crate::timer::get_time_ms;
 use alloc::vec;
 
 use super::net_poll_handler;
 use super::socket::{add_socket, pop_data, remove_socket};
-use super::{build_udp_packet, IPv4, MacAddress, NET_CONFIG};
+use super::{IPv4, NET_CONFIG, build_udp_packet, resolve_mac};
+
+const PRE_SLEEP_POLL_BUDGET: usize = 64;
+const READ_TIMEOUT_MS: usize = 200;
 
 pub struct UDP {
     pub target: IPv4,
@@ -26,6 +31,22 @@ impl UDP {
     }
 }
 
+fn copy_to_user(buf: &mut crate::mm::UserBuffer, data: &[u8]) -> usize {
+    let data_len = data.len();
+    let mut left = 0;
+    for i in 0..buf.buffers.len() {
+        let buffer_i_len = buf.buffers[i].len().min(data_len - left);
+
+        buf.buffers[i][..buffer_i_len].copy_from_slice(&data[left..(left + buffer_i_len)]);
+
+        left += buffer_i_len;
+        if left == data_len {
+            break;
+        }
+    }
+    left
+}
+
 impl File for UDP {
     fn readable(&self) -> bool {
         true
@@ -35,39 +56,29 @@ impl File for UDP {
         true
     }
 
-fn read(&self, mut buf: crate::mm::UserBuffer) -> usize {
-        const MAX_POLLS: u64 = 20_000_000;
-        let mut loops = 0u64;
+    fn read(&self, mut buf: crate::mm::UserBuffer) -> usize {
+        let deadline_ms = get_time_ms() + READ_TIMEOUT_MS;
         loop {
             if let Some(data) = pop_data(self.socket_index) {
-                let data_len = data.len();
-                let mut left = 0;
-                for i in 0..buf.buffers.len() {
-                    let buffer_i_len = buf.buffers[i].len().min(data_len - left);
-
-                    buf.buffers[i][..buffer_i_len]
-                        .copy_from_slice(&data[left..(left + buffer_i_len)]);
-
-                    left += buffer_i_len;
-                    if left == data_len {
-                        break;
-                    }
-                }
-                return left;
-            } else {
-                loops += 1;
-                if loops >= MAX_POLLS {
-                    println!("[udp::read] timeout after {} polls", loops);
-                    return 0;
-                }
-                net_poll_handler();
+                return copy_to_user(&mut buf, &data);
             }
+
+            for _ in 0..PRE_SLEEP_POLL_BUDGET {
+                net_poll_handler();
+                if let Some(data) = pop_data(self.socket_index) {
+                    return copy_to_user(&mut buf, &data);
+                }
+            }
+
+            if get_time_ms() >= deadline_ms {
+                return 0;
+            }
+
+            suspend_current_and_run_next();
         }
     }
 
     fn write(&self, buf: crate::mm::UserBuffer) -> usize {
-        let cfg = NET_CONFIG.exclusive_access();
-
         let mut data = vec![0u8; buf.len()];
         let mut left = 0;
         for i in 0..buf.buffers.len() {
@@ -76,11 +87,20 @@ fn read(&self, mut buf: crate::mm::UserBuffer) -> usize {
         }
 
         let len = data.len();
+        let dst_mac = match resolve_mac(&self.target) {
+            Some(mac) => mac,
+            None => return 0,
+        };
+
+        let cfg = NET_CONFIG.exclusive_access();
+        let src_mac = cfg.mac;
+        let src_ip = cfg.ip;
+        drop(cfg);
 
         let frame = build_udp_packet(
-            &cfg.mac,
-            &MacAddress::BROADCAST,
-            &cfg.ip,
+            &src_mac,
+            &dst_mac,
+            &src_ip,
             &self.target,
             self.sport,
             self.dport,

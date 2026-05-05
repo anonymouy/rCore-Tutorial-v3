@@ -23,6 +23,8 @@ lazy_static! {
 pub trait NetDevice: Send + Sync + Any {
     fn transmit(&self, data: &[u8]);
     fn receive(&self, data: &mut [u8]) -> usize;
+    fn handle_irq(&self);
+    fn mac_address(&self) -> [u8; 6];
     /// Zero-copy transmit: the NIC DMAs directly from `pa` for `len` bytes.
     /// The caller owns the buffer and must keep it valid until the descriptor
     /// is consumed by hardware.
@@ -40,6 +42,15 @@ impl NetDevice for E1000NetWrapper {
         self.0.exclusive_access().receive(data)
     }
 
+    fn handle_irq(&self) {
+        self.0.exclusive_access().ack_interrupts();
+        crate::net::net_poll_budget(64);
+    }
+
+    fn mac_address(&self) -> [u8; 6] {
+        self.0.exclusive_access().mac
+    }
+
     fn transmit_pa(&self, pa: u64, len: u16) {
         self.0.exclusive_access().transmit_pa(pa, len);
     }
@@ -48,8 +59,8 @@ impl NetDevice for E1000NetWrapper {
 impl E1000NetWrapper {
     pub fn new() -> Self {
         // 1. Find e1000 on PCI bus
-        let info = pci::pci_find_device(E1000_VENDOR, E1000_DEVICE)
-            .expect("e1000 not found on PCI bus");
+        let info =
+            pci::pci_find_device(E1000_VENDOR, E1000_DEVICE).expect("e1000 not found on PCI bus");
 
         // 2. If firmware didn't program BAR0 (common on QEMU RISC-V virt,
         //    where RustSBI / OpenSBI does no PCI BAR allocation), do it

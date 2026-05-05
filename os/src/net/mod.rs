@@ -3,7 +3,8 @@ pub mod socket;
 pub mod tcp;
 pub mod udp;
 
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{vec, vec::Vec};
+use core::hint::spin_loop;
 
 use crate::{
     drivers::NET_DEVICE,
@@ -12,6 +13,10 @@ use crate::{
 };
 
 use self::{port_table::check_accept, socket::set_s_a_by_index};
+
+const NEIGHBOR_CACHE_LIMIT: usize = 16;
+const ARP_RESOLVE_TRIES: usize = 3;
+const ARP_RESOLVE_POLL_BUDGET: usize = 256;
 
 // ============================================================
 // Custom network types — replaces lose-net-stack
@@ -106,12 +111,12 @@ pub fn build_udp_packet(
     // --- IPv4 header (20 bytes, offset 14) ---
     let ip = &mut buf[14..34];
     ip[0] = 0x45; // version=4, IHL=5
-    ip[1] = 0;    // DSCP/ECN
+    ip[1] = 0; // DSCP/ECN
     ip[2..4].copy_from_slice(&(ip_total_len as u16).to_be_bytes());
     ip[4..6].copy_from_slice(&0u16.to_be_bytes()); // identification
     ip[6..8].copy_from_slice(&0u16.to_be_bytes()); // flags + fragment offset
-    ip[8] = 64;   // TTL
-    ip[9] = 17;   // protocol = UDP
+    ip[8] = 64; // TTL
+    ip[9] = 17; // protocol = UDP
     ip[10..12].copy_from_slice(&0u16.to_be_bytes()); // checksum placeholder
     ip[12..16].copy_from_slice(&src_ip.0);
     ip[16..20].copy_from_slice(&dst_ip.0);
@@ -146,15 +151,36 @@ pub(super) fn build_arp_reply(
     buf[12..14].copy_from_slice(&0x0806u16.to_be_bytes()); // ARP
 
     // ARP
-    buf[14..16].copy_from_slice(&1u16.to_be_bytes());      // hardware type = Ethernet
+    buf[14..16].copy_from_slice(&1u16.to_be_bytes()); // hardware type = Ethernet
     buf[16..18].copy_from_slice(&0x0800u16.to_be_bytes()); // protocol type = IPv4
-    buf[18] = 6;  // hardware addr len
-    buf[19] = 4;  // protocol addr len
-    buf[20..22].copy_from_slice(&2u16.to_be_bytes());      // operation = reply
-    buf[22..28].copy_from_slice(&our_mac.0);               // sender MAC
-    buf[28..32].copy_from_slice(&our_ip.0);                // sender IP
-    buf[32..38].copy_from_slice(&target_mac.0);            // target MAC
-    buf[38..42].copy_from_slice(&target_ip.0);             // target IP
+    buf[18] = 6; // hardware addr len
+    buf[19] = 4; // protocol addr len
+    buf[20..22].copy_from_slice(&2u16.to_be_bytes()); // operation = reply
+    buf[22..28].copy_from_slice(&our_mac.0); // sender MAC
+    buf[28..32].copy_from_slice(&our_ip.0); // sender IP
+    buf[32..38].copy_from_slice(&target_mac.0); // target MAC
+    buf[38..42].copy_from_slice(&target_ip.0); // target IP
+
+    buf
+}
+
+/// Build an ARP request for `target_ip`.
+pub(super) fn build_arp_request(our_mac: &MacAddress, our_ip: &IPv4, target_ip: &IPv4) -> Vec<u8> {
+    let mut buf = vec![0u8; 42];
+
+    buf[0..6].copy_from_slice(&MacAddress::BROADCAST.0);
+    buf[6..12].copy_from_slice(&our_mac.0);
+    buf[12..14].copy_from_slice(&0x0806u16.to_be_bytes());
+
+    buf[14..16].copy_from_slice(&1u16.to_be_bytes());
+    buf[16..18].copy_from_slice(&0x0800u16.to_be_bytes());
+    buf[18] = 6;
+    buf[19] = 4;
+    buf[20..22].copy_from_slice(&1u16.to_be_bytes());
+    buf[22..28].copy_from_slice(&our_mac.0);
+    buf[28..32].copy_from_slice(&our_ip.0);
+    buf[32..38].fill(0);
+    buf[38..42].copy_from_slice(&target_ip.0);
 
     buf
 }
@@ -263,8 +289,9 @@ fn parse_packet(data: &[u8]) -> ParsedPacket {
                         data[transport_offset + 5],
                     ]) as usize;
                     let payload_start = transport_offset + 8;
-                    let payload_end =
-                        (transport_offset + udp_len).min(14 + ip_total_len).min(data.len());
+                    let payload_end = (transport_offset + udp_len)
+                        .min(14 + ip_total_len)
+                        .min(data.len());
                     let payload = if payload_start < payload_end {
                         data[payload_start..payload_end].to_vec()
                     } else {
@@ -412,6 +439,11 @@ pub struct NetConfig {
     pub mac: MacAddress,
 }
 
+struct NeighborEntry {
+    ip: IPv4,
+    mac: MacAddress,
+}
+
 lazy_static::lazy_static! {
     pub static ref NET_CONFIG: UPIntrFreeCell<NetConfig> = unsafe {
         UPIntrFreeCell::new(NetConfig {
@@ -419,21 +451,95 @@ lazy_static::lazy_static! {
             mac: MacAddress::new([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]),
         })
     };
+    static ref NEIGHBOR_CACHE: UPIntrFreeCell<Vec<NeighborEntry>> =
+        unsafe { UPIntrFreeCell::new(Vec::new()) };
 }
 
-// ============================================================
-// Interrupt handler — parse raw frame
-// ============================================================
+pub fn init() {
+    let mac = NET_DEVICE.mac_address();
+    NET_CONFIG.exclusive_access().mac = MacAddress::new(mac);
+}
 
-pub fn net_poll_handler() {
-    let mut recv_buf = vec![0u8; 2048];
-    let len = NET_DEVICE.receive(&mut recv_buf);
-    if len == 0 {
+fn learn_neighbor(ip: IPv4, mac: MacAddress) {
+    if mac == MacAddress::BROADCAST || mac.0 == [0; 6] || ip.0 == [0; 4] {
         return;
     }
 
-    match parse_packet(&recv_buf[..len]) {
+    let mut cache = NEIGHBOR_CACHE.exclusive_access();
+    for entry in cache.iter_mut() {
+        if entry.ip == ip {
+            entry.mac = mac;
+            return;
+        }
+    }
+    if cache.len() >= NEIGHBOR_CACHE_LIMIT {
+        cache.remove(0);
+    }
+    cache.push(NeighborEntry { ip, mac });
+}
+
+fn lookup_neighbor(ip: &IPv4) -> Option<MacAddress> {
+    let cache = NEIGHBOR_CACHE.exclusive_access();
+    cache
+        .iter()
+        .find(|entry| entry.ip == *ip)
+        .map(|entry| entry.mac)
+}
+
+pub fn resolve_mac(target_ip: &IPv4) -> Option<MacAddress> {
+    if let Some(mac) = lookup_neighbor(target_ip) {
+        return Some(mac);
+    }
+
+    for _ in 0..ARP_RESOLVE_TRIES {
+        let cfg = NET_CONFIG.exclusive_access();
+        let request = build_arp_request(&cfg.mac, &cfg.ip, target_ip);
+        drop(cfg);
+
+        NET_DEVICE.transmit(&request);
+
+        for _ in 0..ARP_RESOLVE_POLL_BUDGET {
+            net_poll_handler();
+            if let Some(mac) = lookup_neighbor(target_ip) {
+                return Some(mac);
+            }
+            spin_loop();
+        }
+    }
+    None
+}
+
+// ============================================================
+// RX path — drain NIC frames and dispatch them into protocol handlers
+// ============================================================
+
+fn frame_is_for_us(data: &[u8]) -> bool {
+    if data.len() < 6 {
+        return false;
+    }
+    let dst_mac = MacAddress::from_bytes(&data[0..6]);
+    let cfg = NET_CONFIG.exclusive_access();
+    dst_mac == cfg.mac || dst_mac == MacAddress::BROADCAST || (dst_mac.0[0] & 1) != 0
+}
+
+fn learn_from_ipv4_frame(data: &[u8]) {
+    if data.len() < 34 || u16::from_be_bytes([data[12], data[13]]) != 0x0800 {
+        return;
+    }
+    let src_mac = MacAddress::from_bytes(&data[6..12]);
+    let src_ip = IPv4::from_bytes(&data[26..30]);
+    learn_neighbor(src_ip, src_mac);
+}
+
+fn handle_frame(data: &[u8]) {
+    if !frame_is_for_us(data) {
+        return;
+    }
+    learn_from_ipv4_frame(data);
+
+    match parse_packet(data) {
         ParsedPacket::Arp(arp) => {
+            learn_neighbor(arp.sender_ip, arp.sender_mac);
             if arp.operation == 1 {
                 let cfg = NET_CONFIG.exclusive_access();
                 if arp.target_ip == cfg.ip {
@@ -488,6 +594,26 @@ pub fn net_poll_handler() {
 
         ParsedPacket::Unknown => {}
     }
+}
+
+pub fn net_poll_budget(budget: usize) -> usize {
+    let mut recv_buf = [0u8; 2048];
+    let mut handled = 0;
+
+    for _ in 0..budget {
+        let len = NET_DEVICE.receive(&mut recv_buf);
+        if len == 0 {
+            break;
+        }
+        handle_frame(&recv_buf[..len]);
+        handled += 1;
+    }
+
+    handled
+}
+
+pub fn net_poll_handler() {
+    net_poll_budget(1);
 }
 
 #[allow(unused)]
