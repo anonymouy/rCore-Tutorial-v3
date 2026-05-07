@@ -4,6 +4,7 @@
 !.devcontainer/devcontainer.json
 !README.md
 
+
 .idea/*
 **/target/
 **/Cargo.lock
@@ -31,3 +32,6 @@ pushall.sh
 # Keep README and the upstream dev-env note; ignore other *.md
 !README.md
 !dev-env-info.md
+
+!/user/src/bin/bench_socket.rs
+!/user/src/bin/bench_bypass.rs
